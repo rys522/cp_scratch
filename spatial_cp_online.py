@@ -29,6 +29,10 @@ xs = np.linspace(0, box, W)
 ys = np.linspace(0, box, H)
 Xg, Yg = np.meshgrid(xs, ys)
 
+# prediction parameters
+
+time_horizon = 3  # one-step ahead
+
 # corpus size
 N = 1000
 
@@ -107,28 +111,45 @@ obst_test  = simulate_brownian_2d(Tsteps, dt, sigma_obst,  x0_obst,  box, rng)
 # ============================
 # 1) Simple obstacle predictor
 # ============================
-def predict_next_cv(y_t, y_tminus1, box):
-    """Constant-velocity predictor: y_{t+1|t} = y_t + (y_t - y_{t-1}) with reflection."""
-    y_pred = y_t + (y_t - y_tminus1)
-    return reflect_to_box(y_pred.copy(), box)
+def predict_h_step_cv(y_t, y_tminus1, h, box):
+    """
+    h-step constant-velocity prediction with per-step reflection.
+
+    y_{t+1|t} = reflect(y_t + (y_t - y_{t-1}))
+    y_{t+2|t} = reflect(y_{t+1|t} + (y_t - y_{t-1}))
+    ...
+    y_{t+h|t} repeats the same velocity and reflects at each step.
+    """
+    v = y_t - y_tminus1
+    y_hat = np.array(y_t, dtype=float)
+    for _ in range(h):
+        y_hat = y_hat + v
+        y_hat = reflect_to_box(y_hat, box)
+    return y_hat
 
 # ==========================================
-# 2) Build TRAIN residual corpus for f(x)
-#    f(x) = d(x, Y_{t+1}) - d(x, Yhat_{t+1|t})
+# 2) Build TRAIN residual corpus for f_h(x)
+#     f_h(x) = d(x, Y_{t+h}) - d(x, Ỹ_{t+h|t})
 # ==========================================
-# Reuse obst_trajs_train already built above.
-# Residuals are defined for t = 1..Tsteps-2 (so that t-1, t, t+1 exist).
-T_res = Tsteps - 2
+h = int(time_horizon)
+assert h >= 1, "time_horizon must be >= 1"
+
+# Residuals are defined for t = 1..Tsteps-h-1 so that (t-1, t, t+h) exist.
+T_res = Tsteps - h - 1
+if T_res <= 0:
+    raise ValueError(f"time_horizon={h} is too large for Tsteps={Tsteps}")
+
 residuals_train = np.zeros((N, T_res, H, W), dtype=np.float32)
 
 for i in range(N):
     o_traj = obst_trajs_train[i]  # (Tsteps, 2)
-    for t in range(1, Tsteps-1):
-        y_tm1, y_t, y_tp1 = o_traj[t-1], o_traj[t], o_traj[t+1]
-        y_hat = predict_next_cv(y_t, y_tm1, box)
-        F_true = distance_field_single_obstacle(y_tp1, Xg, Yg).astype(np.float32)
-        F_pred = distance_field_single_obstacle(y_hat, Xg, Yg).astype(np.float32)
-        residuals_train[i, t-1] = F_pred - F_true  # index shift: t-1 ∈ [0..Tsteps-3]
+    # valid t: 1 .. Tsteps - h - 1  (inclusive)
+    for t in range(1, Tsteps - h):
+        y_tm1, y_t, y_tph = o_traj[t-1], o_traj[t], o_traj[t+h]
+        y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
+        F_true = distance_field_single_obstacle(y_tph, Xg, Yg).astype(np.float32)
+        F_pred = distance_field_single_obstacle(y_hat,  Xg, Yg).astype(np.float32)
+        residuals_train[i, t-1] = F_pred - F_true  # index shift: (t-1) ∈ [0 .. T_res-1]
 
 # ============================================================
 # 3) Functional CP on residual field at a given time t
@@ -184,11 +205,11 @@ def cp_residual_upper_at_t(t_idx: int) -> np.ndarray:
     return g_upper_vec.reshape(H, W).astype(np.float32)
 
 # ============================================================
-# 4) Precompute residual CP lower bounds for all time indices
-#    and build the one-step forecasted distance lower bound
+# 4) Precompute residual CP upper envelopes for all time indices
+#    and build the h-step forecasted distance lower bound
 # ============================================================
 
-# Precompute g_upper for all t
+# Precompute g_upper for all residual time indices
 g_upper_all_t = np.asarray(
     Parallel(n_jobs=n_workers, backend="loky")(
         delayed(cp_residual_upper_at_t)(t_idx) for t_idx in range(T_res)
@@ -196,32 +217,49 @@ g_upper_all_t = np.asarray(
     dtype=np.float32
 )
 
-# Build lower bound for true distance at t+1:
-lower_forecast_at_tplus1 = np.zeros((Tsteps, H, W), dtype=np.float32)
-for t in range(1, Tsteps-1):
+# Build lower bound for true distance at t+h:
+# We'll store at index (t+h), consistent with the "true field at t+h".
+lower_forecast_at_tplusH = np.zeros((Tsteps, H, W), dtype=np.float32)
+
+# For test episode (held out)
+for t in range(1, Tsteps - h):
     y_tm1, y_t = obst_test[t-1], obst_test[t]
-    y_hat = predict_next_cv(y_t, y_tm1, box)
+    y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
     d_pred = distance_field_single_obstacle(y_hat, Xg, Yg).astype(np.float32)
-    g_up   = g_upper_all_t[t-1]                       # align index
-    lower_forecast_at_tplus1[t+1] = np.maximum(d_pred - g_up, 0.0)
+    g_up   = g_upper_all_t[t-1]   # align residual index t-1
+    lower_forecast_at_tplusH[t + h] = np.maximum(d_pred - g_up, 0.0)
 
 # ============================================================
-# 6) Evaluate coverage: true-unsafe pixels missed by prediction
+# 6) Evaluate coverage: true-unsafe pixels missed by prediction (h-step ahead)
 # ============================================================
 
-def evaluate_test_with_seed(seed, g_upper_all_t):
+def evaluate_test_with_seed(seed, g_upper_all_t, h):
+    """
+    Measures mean coverage and mean missed pixels for the h-step forecast.
+    For each valid t, we compare:
+      True unsafe at (t+h): d(x, Y_{t+h}) < safe_threshold
+      Forecast unsafe set:  d_pred(x; Ỹ_{t+h|t}) - g_upper_t(x) < safe_threshold
+      (equivalently, d_pred < safe_threshold + g_upper)
+    """
     rng = np.random.default_rng(seed)
     obst_test = simulate_brownian_2d(Tsteps, dt, sigma_obst, x0_obst, box, rng)
+
     missed, total = [], []
 
-    for t in range(1, Tsteps - 1):
-        F_true = distance_field_single_obstacle(obst_test[t + 1], Xg, Yg)
+    for t in range(1, Tsteps - h):
+        F_true = distance_field_single_obstacle(obst_test[t + h], Xg, Yg)
+
         y_tm1, y_t = obst_test[t - 1], obst_test[t]
-        y_hat = predict_next_cv(y_t, y_tm1, box)
+        y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
         d_pred = distance_field_single_obstacle(y_hat, Xg, Yg)
+
         g_up = g_upper_all_t[t - 1]
+
         mask_true = (F_true < safe_threshold)
+        # Forecasted unsafe if predicted lower bound falls below threshold:
+        # lower_bound = max(d_pred - g_up, 0) < threshold  =>  d_pred < threshold + g_up
         mask_pred = (d_pred < safe_threshold + g_up)
+
         missed.append(np.sum(mask_true & ~mask_pred))
         total.append(np.sum(mask_true))
 
@@ -230,12 +268,12 @@ def evaluate_test_with_seed(seed, g_upper_all_t):
 
 seeds = np.arange(100, 110)
 results = Parallel(n_jobs=-1)(
-    delayed(evaluate_test_with_seed)(s, g_upper_all_t) for s in seeds
+    delayed(evaluate_test_with_seed)(s, g_upper_all_t, h) for s in seeds
 )
 
 coverages, missed_means = zip(*results)
-print(f"Mean coverage: {np.mean(coverages)*100:.2f}% ± {np.std(coverages)*100:.2f}%")
-print(f"Avg missed pixels: {np.mean(missed_means):.1f} ± {np.std(missed_means):.1f}")
+print(f"[h={h}] Mean coverage: {np.mean(coverages)*100:.2f}% ± {np.std(coverages)*100:.2f}%")
+print(f"[h={h}] Avg missed pixels: {np.mean(missed_means):.1f} ± {np.std(missed_means):.1f}")
 
 # ============================================================
 # Visualization: true vs. forecasted CP lower fields
@@ -249,61 +287,54 @@ titles = [
 ]
 
 def update(frame):
-    # Valid frames: t ∈ [1..Tsteps-2]
-    if frame < 1 or frame >= Tsteps - 1:
+    """
+    Animation frame is 't' (decision time). We visualize at time (t+h).
+    Valid frames: t ∈ [1 .. Tsteps - h - 1].
+    """
+    if frame < 1 or frame >= Tsteps - h:
         return
 
     for ax in axs.flat:
         ax.cla()
 
-    # --- (1,1) True field at t+1
-    F_true = distance_field_single_obstacle(obst_test[frame + 1], Xg, Yg)
+    tpH = frame + h  # time where we compare truth vs forecast
+
+    # --- (1,1) True field at t+h
+    F_true = distance_field_single_obstacle(obst_test[tpH], Xg, Yg)
     axs[0, 0].imshow(F_true, extent=[0, box, 0, box], origin="lower")
-    axs[0, 0].plot(robot_test[:frame + 2, 0], robot_test[:frame + 2, 1], 'b-', lw=1)
-    axs[0, 0].plot(obst_test[:frame + 2, 0],  obst_test[:frame + 2, 1],  'r-', lw=1)
-    axs[0, 0].plot(robot_test[frame + 1, 0], robot_test[frame + 1, 1], 'bo', ms=5)
-    axs[0, 0].plot(obst_test[frame + 1, 0],  obst_test[frame + 1, 1],  'rx', ms=7, mew=2)
-    axs[0, 0].set_title(f"{titles[0]} (t={frame} → t+1={frame + 1})")
-    axs[0, 0].set_xlim([0, box])
-    axs[0, 0].set_ylim([0, box])
-    axs[0, 0].set_aspect('equal')
+    axs[0, 0].plot(robot_test[:tpH + 1, 0], robot_test[:tpH + 1, 1], 'b-', lw=1)
+    axs[0, 0].plot(obst_test[:tpH + 1, 0],  obst_test[:tpH + 1, 1],  'r-', lw=1)
+    axs[0, 0].plot(robot_test[tpH, 0], robot_test[tpH, 1], 'bo', ms=5)
+    axs[0, 0].plot(obst_test[tpH, 0],  obst_test[tpH, 1],  'rx', ms=7, mew=2)
+    axs[0, 0].set_title(f"True distance field at t+h (t={frame}, h={h} → {tpH})")
+    axs[0, 0].set_xlim([0, box]); axs[0, 0].set_ylim([0, box]); axs[0, 0].set_aspect('equal')
 
-    # --- (1,2) Forecasted CP lower bound field
-    lower_field = lower_forecast_at_tplus1[frame + 1]
+    # --- (1,2) Forecasted CP lower bound field at t+h
+    lower_field = lower_forecast_at_tplusH[tpH]
     axs[0, 1].imshow(lower_field, extent=[0, box, 0, box], origin="lower")
-    axs[0, 1].plot(robot_test[:frame + 2, 0], robot_test[:frame + 2, 1], 'b-', lw=1)
-    axs[0, 1].plot(obst_test[:frame + 2, 0],  obst_test[:frame + 2, 1],  'r-', lw=1)
-    axs[0, 1].plot(robot_test[frame + 1, 0], robot_test[frame + 1, 1], 'bo', ms=5)
-    axs[0, 1].plot(obst_test[frame + 1, 0],  obst_test[frame + 1, 1],  'rx', ms=7, mew=2)
-    axs[0, 1].set_title(f"{titles[1]} (t={frame} → t+1={frame + 1})")
-    axs[0, 1].set_xlim([0, box])
-    axs[0, 1].set_ylim([0, box])
-    axs[0, 1].set_aspect('equal')
+    axs[0, 1].plot(robot_test[:tpH + 1, 0], robot_test[:tpH + 1, 1], 'b-', lw=1)
+    axs[0, 1].plot(obst_test[:tpH + 1, 0],  obst_test[:tpH + 1, 1],  'r-', lw=1)
+    axs[0, 1].plot(robot_test[tpH, 0], robot_test[tpH, 1], 'bo', ms=5)
+    axs[0, 1].plot(obst_test[tpH, 0],  obst_test[tpH, 1],  'rx', ms=7, mew=2)
+    axs[0, 1].set_title(f"Forecasted CP lower bound at t+h (t={frame}, h={h} → {tpH})")
+    axs[0, 1].set_xlim([0, box]); axs[0, 1].set_ylim([0, box]); axs[0, 1].set_aspect('equal')
 
-    # --- (2,1) True unsafe mask
+    # --- (2,1) True unsafe mask at t+h
     cmap = plt.cm.colors.ListedColormap(['white', 'red'])
     mask_true = (F_true < safe_threshold).astype(float)
     axs[1, 0].imshow(mask_true, extent=[0, box, 0, box], origin="lower", cmap=cmap, vmin=0, vmax=1)
-    axs[1, 0].set_title(f"{titles[2]} (t={frame + 1})")
-    axs[1, 0].set_xlim([0, box])
-    axs[1, 0].set_ylim([0, box])
-    axs[1, 0].set_aspect('equal')
+    axs[1, 0].set_title(f"True unsafe mask at t+h (t={frame}, h={h} → {tpH})")
+    axs[1, 0].set_xlim([0, box]); axs[1, 0].set_ylim([0, box]); axs[1, 0].set_aspect('equal')
 
-    # --- (2,2) Forecasted unsafe mask + True mask overlay
+    # --- (2,2) Forecast vs True unsafe overlay at t+h
     mask_forecast = (lower_field < safe_threshold).astype(float)
-    mask_true = (F_true < safe_threshold).astype(float)
 
-    # Base: forecasted unsafe (red)
     axs[1, 1].imshow(mask_forecast, extent=[0, box, 0, box],
                      origin="lower", cmap="Reds", alpha=0.5, vmin=0, vmax=1)
-    # Overlay: true unsafe (blue)
     axs[1, 1].imshow(mask_true, extent=[0, box, 0, box],
                      origin="lower", cmap="Blues", alpha=0.5, vmin=0, vmax=1)
-
-    axs[1, 1].set_title(f"{titles[3]} (t={frame + 1})")
-    axs[1, 1].set_xlim([0, box])
-    axs[1, 1].set_ylim([0, box])
-    axs[1, 1].set_aspect('equal')
+    axs[1, 1].set_title(f"Unsafe forecast (red) vs True (blue) at t+h (t={frame}, h={h} → {tpH})")
+    axs[1, 1].set_xlim([0, box]); axs[1, 1].set_ylim([0, box]); axs[1, 1].set_aspect('equal')
 
 # Run animation
 ani = FuncAnimation(fig, update, frames=range(1, Tsteps - 1), blit=False, interval=150)
