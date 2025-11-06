@@ -149,7 +149,7 @@ for i in range(N):
         y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
         F_true = distance_field_single_obstacle(y_tph, Xg, Yg).astype(np.float32)
         F_pred = distance_field_single_obstacle(y_hat,  Xg, Yg).astype(np.float32)
-        residuals_train[i, t-1] = F_pred - F_true  # index shift: (t-1) ∈ [0 .. T_res-1]
+        residuals_train[i, t-1] = F_pred - F_true  # index shift: (t-1) ∈ [0 .. T_res-1], at time t+h
 
 # ============================================================
 # 3) Functional CP on residual field at a given time t
@@ -211,7 +211,7 @@ def cp_residual_upper_at_t(t_idx: int) -> np.ndarray:
 
 # Precompute g_upper for all residual time indices
 g_upper_all_t = np.asarray(
-    Parallel(n_jobs=n_workers, backend="loky")(
+    Parallel(n_jobs=n_workers)(
         delayed(cp_residual_upper_at_t)(t_idx) for t_idx in range(T_res)
     ),
     dtype=np.float32
