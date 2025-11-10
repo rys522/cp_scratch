@@ -631,11 +631,14 @@ def animate_cp_comparison(
     return ani
 
 # ============================================================
-# 10) Main experiment (fully ego-centric)
+# 10) Main experiment
 # ============================================================
 
 def main():
     rng = np.random.default_rng(SEED)
+# ============================================================
+#  offline training on training episodes
+# ============================================================
 
     # Load + normalize + split
     episodes_raw = load_episodes(DATA_PATH)                 # list[(T_i,2)] or ndarray
@@ -698,6 +701,10 @@ def main():
     ).astype(np.float32)
     print(f"[Info] g_upper_all_t: shape={g_upper_all_t.shape}")
 
+# ============================================================
+#   online evaluation on test episodes
+# ============================================================
+
     # Held-out test episode (single representative)
     ep_test = test_eps[rng.integers(len(test_eps))]
     if ep_test.shape[0] < TSTEPS:
@@ -715,6 +722,10 @@ def main():
         Xg_rel=Xg_rel, Yg_rel=Yg_rel,
         g_upper_all_t=g_upper_all_t, h=TIME_HORIZON, box=BOX
     )
+
+# ============================================================
+#   Coverage evaluation + Visualization
+# ============================================================
 
     # Coverage on random test episodes 
     test_pool_obst = []
