@@ -40,10 +40,10 @@ EVAL_SEEDS = np.arange(SEED + 100, SEED + 110)
 SAFE_THRESHOLD = 8.0
 
 # CP hyperparams
-P_BASE = 3
-K_MIX = 4
-ALPHA = 0.05
-TEST_SIZE = 0.30
+P_BASE = 3              # basis for PCA
+K_MIX = 4               # GMM components
+ALPHA = 0.05            # miscoverage level
+TEST_SIZE = 0.30        # calibration size for CP
 RANDOM_STATE = 0
 N_JOBS = max(1, (os.cpu_count() or 4) - 2)
 BACKEND = "loky"
@@ -54,7 +54,7 @@ AGENT_FIXED_XY = (BOX/2, BOX/2)
 EGO_ALIGN_HEADING = False        # if you have heading, you can rotate the ego frame
 
 # ============================================================
-# 1) Utils: grids, transforms, distance fields (EGO)
+# 1) Utils: grids, transforms, distance fields 
 # ============================================================
 
 def build_grid(ego_box: float, H: int, W: int):
@@ -80,7 +80,7 @@ def reflect_to_box(pos: np.ndarray, box: float) -> np.ndarray:
     return pos
 
 
-def world_to(points: np.ndarray, agent_xy: np.ndarray, align_heading=False, heading_rad=0.0):
+def world_to_ego(points: np.ndarray, agent_xy: np.ndarray, align_heading=False, heading_rad=0.0):
     """Translate (and optionally rotate) world coords to ego coords centered at agent_xy.
     points: (...,2); agent_xy: (2,)
     returns (...,2)
@@ -113,10 +113,11 @@ def distance_field_points(points_rel: np.ndarray, Xg_rel: np.ndarray, Yg_rel: np
 
 
 # ============================================================
-# 2) Data loading + normalization (WORLD)
+# 2) Data loading + normalization
 # ============================================================
 
 def _apply_homography_if_available(xy: np.ndarray, H_path: str | None) -> np.ndarray:
+    """Apply homography H if H_path exists; else return xy unchanged."""
     if not H_path or not os.path.isfile(H_path):
         return xy
     try:
@@ -233,7 +234,7 @@ def select_obstacle_traj(ep: np.ndarray, use_multi: bool, target_id: int):
     return ep[:, tid, :]
 
 # ============================================================
-# 3) Predictor (WORLD)
+# 3) Predictor (World)
 # ============================================================
 
 def predict_h_step_cv(y_t: np.ndarray, y_tm1: np.ndarray, h: int, box: float) -> np.ndarray:
@@ -245,7 +246,7 @@ def predict_h_step_cv(y_t: np.ndarray, y_tm1: np.ndarray, h: int, box: float) ->
     return y_hat
 
 # ============================================================
-# 4) Agent trajectory (WORLD)
+# 4) Agent trajectory 
 # ============================================================
 
 def build_agent_traj(T: int, source: str, box: float, obst_ref: np.ndarray | None = None):
@@ -265,7 +266,8 @@ def build_agent_traj(T: int, source: str, box: float, obst_ref: np.ndarray | Non
     raise ValueError(f"Unsupported AGENT_SOURCE={source}. Use 'fixed'|'copy_obst'|'random_walk'.")
 
 # ============================================================
-# 5) Training corpus: residual fields (EGO)
+# 5) Training corpus: residual fields 
+#     f_h(x) = d(x, Y_{t+h}) - d(x, Ỹ_{t+h|t})
 # ============================================================
 
 def build_training_residuals(
@@ -298,13 +300,13 @@ def build_training_residuals(
 
             # anchor at agent(t)
             a_t = agent[t]
-            y_hat_rel = world_to(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
+            y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
 
             if use_multi and (multi is not None) and (multi.ndim == 3):
-                y_true_rel = world_to(multi[t+h], a_t, align_heading=EGO_ALIGN_HEADING)
+                y_true_rel = world_to_ego(multi[t+h], a_t, align_heading=EGO_ALIGN_HEADING)
                 F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
             else:
-                y_true_rel = world_to(y_tph, a_t, align_heading=EGO_ALIGN_HEADING)
+                y_true_rel = world_to_ego(y_tph, a_t, align_heading=EGO_ALIGN_HEADING)
                 F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
 
             F_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
@@ -312,7 +314,8 @@ def build_training_residuals(
     return residuals
 
 # ============================================================
-# 6) Functional CP (PCA + GMM) on residuals (unchanged)
+# 6) Functional CP (PCA + GMM) on residuals
+#    Returns upper envelope \underline f_t(x) on the residuals
 # ============================================================
 
 def cp_upper_for_index(
@@ -342,24 +345,57 @@ def cp_upper_for_index(
     K_eff = min(K, max(1, len(Xi_train)))
     gmm = GaussianMixture(n_components=K_eff, covariance_type="full", random_state=random_state).fit(Xi_train)
 
+#    Conformal threshold λ
+#    Nonconformity score: s(x) = -f(x), so larger density → smaller score
+#    λ chosen as the quantile of calibration scores
     logf_cal = gmm.score_samples(Xi_cal)
     q_log = np.quantile(logf_cal, 1.0 - alpha)
     lam = float(np.exp(q_log))
+
+#    Ellipsoid parameters for each mixture component
+#    T_{n,k} = {ξ : φ_k(ξ; μ_k, Σ_k) ≥ λ/(K π_k)}
 
     pis = gmm.weights_
     mus = gmm.means_
     Sigmas = gmm.covariances_
 
     def _rk_sq(k: int) -> float:
+
+    # Compute the ellipsoid radius squared (r_k^2) for the k-th Gaussian component
+    # given the conformal threshold λ.
+    
+    # Step 1: Define the density threshold τ for component k.
+    # This comes from the outer bound condition:
+    #   φ_k(ξ; μ_k, Σ_k) >= λ / (K * π_k)
         tau = lam / (K_eff * pis[k])
+
+    # Step 2: Access the covariance matrix of component k.
+
         Sk = Sigmas[k]
         _det = det(Sk)
         if _det <= 0 or not np.isfinite(_det):
             Sk = Sk + 1e-8 * np.eye(Sk.shape[0])
             _det = det(Sk)
+
+    # Step 3: Rearrange the Gaussian density inequality:
+    #   φ(ξ; μ, Σ) >= τ
+    # ↔ exp(-0.5 * (ξ-μ)^T Σ^{-1} (ξ-μ)) >= τ * (2π)^(p/2) * |Σ|^(1/2)
+    #
+    # Define the RHS constant:
         val = tau * ((2.0 * np.pi) ** (p_eff / 2.0)) * math.sqrt(max(_det, 0.0))
         if (not np.isfinite(val)) or val <= 0.0:
             return 0.0
+        
+    # Step 4: Take logs and rearrange:
+    #   (ξ-μ)^T Σ^{-1} (ξ-μ) <= -2 log(val)
+    #
+    # This gives an ellipsoid centered at μ with shape Σ
+    # and radius squared r_k^2 = -2 log(val).
+    #
+    # Step 5: Numerical safeguard:
+    # If val > 1, log(val) > 0 → RHS becomes negative,
+    # meaning the inequality describes an empty set.
+    # In that case, return 0.0 to avoid negative radius squared.
         return max(0.0, -2.0 * math.log(val))
 
     rks = np.array([math.sqrt(_rk_sq(k)) for k in range(K_eff)], dtype=np.float64)
@@ -375,6 +411,8 @@ def cp_upper_for_index(
         quad_diag = np.einsum("dp,dp->d", AS, AT)
         quad_diag = np.clip(quad_diag, 0.0, np.inf)
         rad = rk * np.sqrt(quad_diag)
+            #    For each t: ell_k(t) = a^T μ_k - r_k ||Σ^{1/2} a||,
+            #                upp_k(t) = a^T μ_k + r_k ||Σ^{1/2} a||    
         upper[k] = center + rad
 
     g_upper_vec = mean_vec + np.nanmax(upper, axis=0)
@@ -404,6 +442,28 @@ def build_lower_forecast_fields(
     Xg_rel: np.ndarray, Yg_rel: np.ndarray,
     g_upper_all_t: np.ndarray, h: int, box: float
 ) -> np.ndarray:
+    """
+    Build the *lower forecast distance fields* (conservative safety maps).
+
+    ---------------------------------------------------------------------
+        ℓ(x, i, t) = d^ego(x, ŷ_{t+h|t}) − d^ego(x, y_{t+h})
+        P( ℓ(x, i, t) ≤ u(1−α) ) ≥ 1−α                (Conformal bound)
+
+    Hence, with probability ≥ (1−α):
+
+        d^ego(x, y_{t+h}) ≥ r_safe
+        ⇐ d^ego(x, ŷ_{t+h|t}) ≥ r_safe + u(1−α)
+
+    Implementation equivalence:
+        lower[t+h](x) = max( d_pred(x) − g_upper(x), 0 )
+
+    →  d_pred : predicted distance field from ego to forecasted obstacle
+       g_upper : spatial uncertainty upper bound (e.g., conformal quantile)
+       lower   : conservative distance field ensuring safety at level (1−α)
+    ---------------------------------------------------------------------
+    Output:
+        lower[t] ∈ [0, ∞) — ego-centric conservative distance field over time.
+    """
     T = obst_traj_test.shape[0]
     H, W = Xg_rel.shape
     lower = np.zeros((T, H, W), dtype=np.float32)
@@ -413,7 +473,7 @@ def build_lower_forecast_fields(
         y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
 
         a_t = agent_traj_test[t]
-        y_hat_rel = world_to(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
+        y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
 
         d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
         g_up = g_upper_all_t[t - 1]
@@ -447,8 +507,8 @@ def evaluate_coverage(
             y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
 
             a_t = agent[t]
-            y_true_rel = world_to(obst[t+h], a_t, align_heading=EGO_ALIGN_HEADING)
-            y_hat_rel  = world_to(y_hat,      a_t, align_heading=EGO_ALIGN_HEADING)
+            y_true_rel = world_to_ego(obst[t+h], a_t, align_heading=EGO_ALIGN_HEADING)
+            y_hat_rel  = world_to_ego(y_hat,      a_t, align_heading=EGO_ALIGN_HEADING)
 
             F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
             d_pred = distance_field_points(y_hat_rel,  Xg_rel, Yg_rel)
@@ -618,7 +678,7 @@ def main():
     for i in range(N_TRAIN):
         agent_trajs[i] = build_agent_traj(TSTEPS, AGENT_SOURCE, BOX, obst_ref=obst_trajs[i])
 
-    # Residual tensor (EGO)
+    # Residual tensor 
     residuals_train = build_training_residuals(
         obst_trajs=obst_trajs,
         agent_trajs=agent_trajs,
@@ -649,14 +709,14 @@ def main():
     obst_test = select_obstacle_traj(ep_test, use_multi=False, target_id=TARGET_ID).astype(np.float32)
     agent_test = build_agent_traj(TSTEPS, AGENT_SOURCE, BOX, obst_ref=obst_test)
 
-    # Lower-bound fields (EGO)
+    # Lower-bound fields 
     lower_forecast = build_lower_forecast_fields(
         obst_traj_test=obst_test, agent_traj_test=agent_test,
         Xg_rel=Xg_rel, Yg_rel=Yg_rel,
         g_upper_all_t=g_upper_all_t, h=TIME_HORIZON, box=BOX
     )
 
-    # Coverage on random test episodes (EGO)
+    # Coverage on random test episodes 
     test_pool_obst = []
     test_pool_agent = []
     for ep in test_eps:
@@ -689,19 +749,19 @@ def main():
     true_fields_ego = np.zeros((T, H, W), dtype=np.float32)
     for t in range(T):
         a_t = agent_test[t]
-        y_true_rel = world_to(obst_test[t], a_t, align_heading=EGO_ALIGN_HEADING)
+        y_true_rel = world_to_ego(obst_test[t], a_t, align_heading=EGO_ALIGN_HEADING)
         true_fields_ego[t] = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
 
     ani = animate_cp_comparison(
         agent_traj=agent_test,
         obst_traj=obst_test,
         true_fields_ego=true_fields_ego,      
-        lower_fields_ego=lower_forecast,      # <-- ego 필드
-        box=BOX,                              # <-- WORLD 축 범위
-        ego_box=EGO_BOX,                      # <-- ego 윈도우 크기
+        lower_fields_ego=lower_forecast,      
+        box=BOX,                              
+        ego_box=EGO_BOX,                      
         safe_threshold=SAFE_THRESHOLD,
         h=TIME_HORIZON,
-        headings=None,                        # 혹은 headings=robot_heading_rad
+        headings=None,                        
         interval=150
     )
     plt.show()
