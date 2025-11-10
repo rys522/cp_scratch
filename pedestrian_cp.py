@@ -741,8 +741,8 @@ def main():
         g_upper_all_t=g_upper_all_t, h=TIME_HORIZON,
         safe_threshold=SAFE_THRESHOLD, box=BOX
     )
-    print(f"[h={TIME_HORIZON}] Mean coverage (ego): {mean_cov*100:.2f}% ± {std_cov*100:.2f}%")
-    print(f"[h={TIME_HORIZON}] Avg missed pixels (ego): {mean_miss:.1f} ± {std_miss:.1f}")
+    print(f"[h={TIME_HORIZON}] Mean coverage : {mean_cov*100:.2f}% ± {std_cov*100:.2f}%")
+    print(f"[h={TIME_HORIZON}] Avg missed pixels : {mean_miss:.1f} ± {std_miss:.1f}")
 
     # Visualization (EGO): build true distance fields w.r.t. agent(t)
     T = obst_test.shape[0]
