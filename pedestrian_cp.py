@@ -18,7 +18,7 @@ import pickle
 
 # Data
 DATA_PATH = "./data/seq_eth"   # expects key 'episodes' with shape (E,T,2) or (E,T,M,2)
-USE_MULTI_OBST = True           # if True, truth field uses min-dist to all agents at each t
+USE_MULTI_OBST = False           # if True, truth field uses min-dist to all agents at each t
 TARGET_ID = 0                    # used when USE_MULTI_OBST=False and episodes are (E,T,M,2)
 
 # Grid / domain (world is used only for loading & reflection; all fields are EGO)
@@ -245,19 +245,6 @@ def predict_h_step_cv(y_t: np.ndarray, y_tm1: np.ndarray, h: int, box: float) ->
         y_hat = reflect_to_box(y_hat, box)
     return y_hat
 
-def predict_h_step_cv_multi(Y_t: np.ndarray, Y_tm1: np.ndarray, h: int, box: float) -> np.ndarray:
-    """
-    Y_t, Y_tm1: (M,2) at time t, t-1 
-    return: (M,2) at t+h
-    """
-    v = Y_t - Y_tm1             # (M,2)
-    Y_hat = Y_t.astype(float).copy()
-    for _ in range(h):
-        Y_hat = Y_hat + v
-        for m in range(Y_hat.shape[0]):
-            Y_hat[m] = reflect_to_box(Y_hat[m], box)
-    return Y_hat
-
 # ============================================================
 # 4) Agent trajectory 
 # ============================================================
@@ -284,13 +271,17 @@ def build_agent_traj(T: int, source: str, box: float, obst_ref: np.ndarray | Non
 # ============================================================
 
 def build_training_residuals(
-    obst_trajs: np.ndarray,     # (N,T,2)  *single anchor* (유지)
-    agent_trajs: np.ndarray,    # (N,T,2)
-    full_eps: np.ndarray | None,# when USE_MULTI_OBST: list-like of (T,M,2)
+    obst_trajs: np.ndarray,     # (N,T,2) representative single traj per sample
+    agent_trajs: np.ndarray,    # (N,T,2) agent in WORLD coords
+    full_eps: np.ndarray | None,
     use_multi: bool,
     Xg_rel: np.ndarray, Yg_rel: np.ndarray,
     h: int, box: float
 ) -> np.ndarray:
+    """Residual tensor in EGO frame.
+    residual[i, t-1] = d_pred^ego(x; y_hat_{t+h|t}) - d_true^ego(x; y_{t+h})
+    anchor for both terms is agent at time t.
+    """
     N, T, _ = obst_trajs.shape
     H, W = Xg_rel.shape
     T_res = T - h - 1
@@ -299,36 +290,26 @@ def build_training_residuals(
     residuals = np.zeros((N, T_res, H, W), dtype=np.float32)
 
     for i in range(N):
-        single = obst_trajs[i]              # (T,2)
-        agent  = agent_trajs[i]             # (T,2)
+        single = obst_trajs[i]           # (T,2)
+        agent  = agent_trajs[i]          # (T,2)
         multi  = full_eps[i] if (use_multi and full_eps is not None) else None  # (T,M,2) or None
 
         for t in range(1, T - h):
+            y_tm1, y_t, y_tph = single[t-1], single[t], single[t+h]
+            y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
+
+            # anchor at agent(t)
             a_t = agent[t]
+            y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
 
             if use_multi and (multi is not None) and (multi.ndim == 3):
-                # --- TRUE: min-dist to all true obstacles at t+h ---
-                Y_true = multi[t + h]                    # (M,2)
-                y_true_rel = world_to_ego(Y_true, a_t, align_heading=EGO_ALIGN_HEADING)
+                y_true_rel = world_to_ego(multi[t+h], a_t, align_heading=EGO_ALIGN_HEADING)
                 F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
-
-                # --- PRED: predict all obstacles with CV, min-dist ---
-                Y_t    = multi[t]                        # (M,2)
-                Y_tm1  = multi[t - 1]                    # (M,2)
-                Y_hat  = predict_h_step_cv_multi(Y_t, Y_tm1, h, box)    # (M,2)
-                y_hat_rel = world_to_ego(Y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
-                F_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
             else:
-                # single-object path 
-                y_tm1, y_t, y_tph = single[t-1], single[t], single[t+h]
-                y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
-
                 y_true_rel = world_to_ego(y_tph, a_t, align_heading=EGO_ALIGN_HEADING)
                 F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
 
-                y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
-                F_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
-
+            F_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
             residuals[i, t-1] = F_pred - F_true
     return residuals
 
@@ -457,32 +438,44 @@ def compute_cp_upper_envelopes(
 # ============================================================
 
 def build_lower_forecast_fields(
-    obst_traj_test: np.ndarray,      # (T,2) or (T,M,2)
-    agent_traj_test: np.ndarray,     # (T,2)
+    obst_traj_test: np.ndarray, agent_traj_test: np.ndarray,
     Xg_rel: np.ndarray, Yg_rel: np.ndarray,
     g_upper_all_t: np.ndarray, h: int, box: float
 ) -> np.ndarray:
+    """
+    Build the *lower forecast distance fields* (conservative safety maps).
+
+    ---------------------------------------------------------------------
+        ℓ(x, i, t) = d^ego(x, ŷ_{t+h|t}) − d^ego(x, y_{t+h})
+        P( ℓ(x, i, t) ≤ u(1−α) ) ≥ 1−α                (Conformal bound)
+
+    Hence, with probability ≥ (1−α):
+
+        d^ego(x, y_{t+h}) ≥ r_safe
+        ⇐ d^ego(x, ŷ_{t+h|t}) ≥ r_safe + u(1−α)
+
+    Implementation equivalence:
+        lower[t+h](x) = max( d_pred(x) − g_upper(x), 0 )
+
+    →  d_pred : predicted distance field from ego to forecasted obstacle
+       g_upper : spatial uncertainty upper bound (e.g., conformal quantile)
+       lower   : conservative distance field ensuring safety at level (1−α)
+    ---------------------------------------------------------------------
+    Output:
+        lower[t] ∈ [0, ∞) — ego-centric conservative distance field over time.
+    """
     T = obst_traj_test.shape[0]
     H, W = Xg_rel.shape
     lower = np.zeros((T, H, W), dtype=np.float32)
 
-    is_multi = (obst_traj_test.ndim == 3)
-
     for t in range(1, T - h):
+        y_tm1, y_t = obst_traj_test[t-1], obst_traj_test[t]
+        y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
+
         a_t = agent_traj_test[t]
+        y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
 
-        if is_multi:
-            Y_t   = obst_traj_test[t]       # (M,2)
-            Y_tm1 = obst_traj_test[t-1]     # (M,2)
-            Y_hat = predict_h_step_cv_multi(Y_t, Y_tm1, h, box)   # (M,2)
-            y_hat_rel = world_to_ego(Y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
-            d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
-        else:
-            y_tm1, y_t = obst_traj_test[t-1], obst_traj_test[t]
-            y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
-            y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
-            d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
-
+        d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel) # d_pred^ego
         g_up = g_upper_all_t[t - 1]
         lower[t + h] = np.maximum(d_pred - g_up, 0.0)
     return lower
@@ -507,36 +500,26 @@ def evaluate_coverage(
         ep_idx = int(rng.integers(E_test))
         obst = test_pool_obst[ep_idx]
         agent = test_pool_agent[ep_idx]
-        is_multi = (obst.ndim == 3)
 
         misses, totals = [], []
         for t in range(1, obst.shape[0] - h):
+            y_tm1, y_t = obst[t-1], obst[t]
+            y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
+
             a_t = agent[t]
+            y_true_rel = world_to_ego(obst[t+h], a_t, align_heading=EGO_ALIGN_HEADING)
+            y_hat_rel  = world_to_ego(y_hat,      a_t, align_heading=EGO_ALIGN_HEADING)
 
-            if is_multi:
-                Y_true = obst[t + h]                                   # (M,2)
-                y_true_rel = world_to_ego(Y_true, a_t, align_heading=EGO_ALIGN_HEADING)
-                F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
-
-                Y_t, Y_tm1 = obst[t], obst[t-1]
-                Y_hat = predict_h_step_cv_multi(Y_t, Y_tm1, h, box)    # (M,2)
-                y_hat_rel = world_to_ego(Y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
-                d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
-            else:
-                y_true_rel = world_to_ego(obst[t + h], a_t, align_heading=EGO_ALIGN_HEADING)
-                F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
-
-                y_tm1, y_t = obst[t-1], obst[t]
-                y_hat = predict_h_step_cv(y_t, y_tm1, h, box)
-                y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
-                d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
-
+            F_true = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
+            d_pred = distance_field_points(y_hat_rel,  Xg_rel, Yg_rel)
             g_up = g_upper_all_t[t - 1]
+
             mask_true = (F_true < safe_threshold)
             mask_pred = (d_pred < safe_threshold + g_up)
 
-            misses.append(np.sum(mask_true & ~mask_pred))
-            totals.append(np.sum(mask_true))
+            missed = np.sum(mask_true & ~mask_pred)
+            total  = np.sum(mask_true)
+            misses.append(missed); totals.append(total)
 
         misses = np.array(misses, dtype=float)
         totals = np.array(totals, dtype=float) + 1e-8
@@ -748,23 +731,18 @@ def main():
     test_pool_obst = []
     test_pool_agent = []
     for ep in test_eps:
-        rep = select_obstacle_traj(ep, use_multi=USE_MULTI_OBST, target_id=TARGET_ID)  # (T,2) or (T,M,2)
+        rep = select_obstacle_traj(ep, use_multi=False, target_id=TARGET_ID)
         if rep.shape[0] < TSTEPS:
-            if rep.ndim == 2:
-                pad = np.repeat(rep[-1][None, :], TSTEPS - rep.shape[0], axis=0)
-            else:  # (T,M,2)
-                pad = np.repeat(rep[-1][None, :, :], TSTEPS - rep.shape[0], axis=0)
+            pad = np.repeat(rep[-1][None, :], TSTEPS - rep.shape[0], axis=0)
             rep = np.concatenate([rep, pad], axis=0)
         else:
             rep = rep[:TSTEPS]
         rep = rep.astype(np.float32)
-
         test_pool_obst.append(rep)
-        anchor_for_agent = rep if rep.ndim == 2 else rep[:, 0, :]  
-        test_pool_agent.append(build_agent_traj(TSTEPS, AGENT_SOURCE, BOX, obst_ref=anchor_for_agent))
+        test_pool_agent.append(build_agent_traj(TSTEPS, AGENT_SOURCE, BOX, obst_ref=rep))
 
-    test_pool_obst = np.asarray(test_pool_obst, dtype=object if USE_MULTI_OBST else np.float32)
-    test_pool_agent = np.asarray(test_pool_agent, dtype=object if USE_MULTI_OBST else np.float32)
+    test_pool_obst = np.asarray(test_pool_obst, dtype=np.float32)
+    test_pool_agent = np.asarray(test_pool_agent, dtype=np.float32)
 
     mean_cov, std_cov, mean_miss, std_miss = evaluate_coverage(
         seeds=EVAL_SEEDS,
@@ -780,14 +758,9 @@ def main():
     # Visualization (EGO): build true distance fields w.r.t. agent(t)
     T = obst_test.shape[0]
     true_fields_ego = np.zeros((T, H, W), dtype=np.float32)
-    is_multi_test = (obst_test.ndim == 3)
-
     for t in range(T):
         a_t = agent_test[t]
-        if is_multi_test:
-            y_true_rel = world_to_ego(obst_test[t], a_t, align_heading=EGO_ALIGN_HEADING)  # (M,2)
-        else:
-            y_true_rel = world_to_ego(obst_test[t], a_t, align_heading=EGO_ALIGN_HEADING)  # (2,)
+        y_true_rel = world_to_ego(obst_test[t], a_t, align_heading=EGO_ALIGN_HEADING)
         true_fields_ego[t] = distance_field_points(y_true_rel, Xg_rel, Yg_rel)
 
     ani = animate_cp_comparison(
