@@ -22,7 +22,7 @@ USE_MULTI_OBST = False           # if True, truth field uses min-dist to all age
 TARGET_ID = 0                    # used when USE_MULTI_OBST=False and episodes are (E,T,M,2)
 
 # Grid / domain (world is used only for loading & reflection; all fields are EGO)
-H, W = 64, 64
+H, W = 64, 64                    
 BOX = 100.0                      # world normalization box (for data scaling & reflection)
 SCALING = None                   # (sx, sy) world->meters; if None, computed from data bounds
 
@@ -475,7 +475,7 @@ def build_lower_forecast_fields(
         a_t = agent_traj_test[t]
         y_hat_rel = world_to_ego(y_hat, a_t, align_heading=EGO_ALIGN_HEADING)
 
-        d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel)
+        d_pred = distance_field_points(y_hat_rel, Xg_rel, Yg_rel) # d_pred^ego
         g_up = g_upper_all_t[t - 1]
         lower[t + h] = np.maximum(d_pred - g_up, 0.0)
     return lower
