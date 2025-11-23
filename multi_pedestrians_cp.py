@@ -48,22 +48,10 @@ AGENT_SOURCE = "random_walk"    # "fixed" | "copy_obst" | "random_walk" | "from_
 AGENT_FIXED_XY = (BOX/2, BOX/2)
 EGO_ALIGN_HEADING = False        # if you have heading, you can rotate the ego frame
 
-# ============================================================
-# 1) Utils: grids, transforms, distance fields 
-# ============================================================
-
-
-
 
 
 # ============================================================
-# 2) Data loading + normalization
-# ============================================================
-
-
-
-# ============================================================
-# 3) Predictor (World)
+# Predictor
 # ============================================================
 
 def predict_h_step_cv(y_t: np.ndarray, y_tm1: np.ndarray, h: int, box: float) -> np.ndarray:
@@ -192,7 +180,7 @@ def build_lower_forecast_fields(
     return lower
 
 # ============================================================
-# Coverage evaluation (EGO)
+# Coverage evaluation
 # ============================================================
 
 def evaluate_coverage(
