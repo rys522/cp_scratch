@@ -1,16 +1,8 @@
 from __future__ import annotations
 import os
-import math
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib.transforms import Affine2D
-from numpy.linalg import det
-from sklearn.decomposition import PCA
-from sklearn.mixture import GaussianMixture
-from sklearn.model_selection import train_test_split
-from preprocess import *
-from joblib import Parallel, delayed
+from preprocess import normalize_world, split_train_test, select_obstacle_traj, load_episodes
 
 from cp.functional_cp import compute_cp_upper_envelopes
 from .utils import build_grid, reflect_to_box, world_to_ego, animate_cp_comparison, distance_field_points
@@ -238,7 +230,8 @@ def evaluate_coverage(
 
             missed = np.sum(mask_true & ~mask_pred)
             total  = np.sum(mask_true)
-            misses.append(missed); totals.append(total)
+            misses.append(missed)
+            totals.append(total)
 
         misses = np.array(misses, dtype=float)
         totals = np.array(totals, dtype=float) + 1e-8
