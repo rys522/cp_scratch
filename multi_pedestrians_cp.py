@@ -22,13 +22,13 @@ EGO_BOX = 60.0
 TSTEPS = 12
 N_TRAIN = 1000
 SEED = 2023
-TIME_HORIZON = 4
+TIME_HORIZON = 1
 EVAL_SEEDS = np.arange(SEED + 100, SEED + 110)
 
 SAFE_THRESHOLD = 4
 
 P_BASE = 3
-K_MIX = 4
+K_MIX = 5
 ALPHA = 0.05
 TEST_SIZE = 0.30
 RANDOM_STATE = 0
@@ -382,7 +382,9 @@ def main():
         headings=None,
         interval=150,
     )
+    ani.save("cp.mp4", fps=5, dpi=200, bitrate=4000)
     plt.show()
+
 
 if __name__ == "__main__":
     main()

@@ -277,19 +277,18 @@ def animate_cp_comparison(
     return ani
 
 def animate_cp_comparison_multi(
-    agent_traj: np.ndarray,            # (T, 2)
-    obst_traj:  np.ndarray,            # (T, M, 2) TRUE obstacle traj at target times
-    obst_pred_traj: np.ndarray,        # (T, M, 2) PRED obstacle traj at same target times
-    true_fields_ego: np.ndarray,       # (T, H, W) TRUE distance field at target times
-    lower_fields_ego: np.ndarray,      # (T, H, W) CP lower field at target times
+    agent_traj: np.ndarray,
+    obst_traj:  np.ndarray,
+    obst_pred_traj: np.ndarray,
+    true_fields_ego: np.ndarray,
+    lower_fields_ego: np.ndarray,
     box: float,
-    ego_box: float,
+    ego_box: float,           # (사용은 안 하지만 시그니처 유지)
     safe_threshold: float,
-    h: int,                            # time horizon label only (for title)
+    h: int,
     headings: np.ndarray = None,
     interval: int = 150
 ):
-
     # Ensure 3D for obstacle trajectories
     if obst_traj.ndim == 2:
         obst_traj = obst_traj[:, np.newaxis, :]
@@ -300,139 +299,131 @@ def animate_cp_comparison_multi(
     T_pred, M2, _ = obst_pred_traj.shape
     assert M == M2, "M must match between true and pred traj"
 
-    T = min(
-        agent_traj.shape[0],
-        T_obs,
-        T_pred,
-        true_fields_ego.shape[0],
-        lower_fields_ego.shape[0],
-    )
-
+    T = min(agent_traj.shape[0], T_obs, T_pred,
+            true_fields_ego.shape[0], lower_fields_ego.shape[0])
     if T < 2:
         raise ValueError(f"Not enough time steps for animation. Got T={T}.")
 
-    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+    set_mpl_defaults(fontsize=12, tight_layout=False)
+
+    fig, axs = plt.subplots(
+        2, 2,
+        figsize=(9.5, 8.0),   # (가로를 좀 더 줘야 2x2가 커 보임)
+        dpi=180,
+        constrained_layout=True
+    )
+    fig.patch.set_facecolor("white")
     axs = np.array(axs)
 
-    # Color palette for each obstacle m
+    cmap_warn = plt.cm.colors.ListedColormap(['white', 'red'])
     cmap = plt.cm.get_cmap("tab10", M)
     colors = [cmap(i) for i in range(M)]
 
-    cmap_warn = plt.cm.colors.ListedColormap(['white', 'red'])
-
-    def plot_obstacles(ax, t_idx):
-        """True and predicted traj for all obstacles at target time index t_idx."""
-        for m in range(M):
-            col = colors[m]
-
-            # TRUE history
-            ax.plot(
-                obst_traj[:t_idx+1, m, 0],
-                obst_traj[:t_idx+1, m, 1],
-                '-', color=col, lw=1.5, alpha=0.9
-            )
-            # TRUE current
-            ax.plot(
-                obst_traj[t_idx, m, 0],
-                obst_traj[t_idx, m, 1],
-                'x', color=col, ms=7, mew=2
-            )
-
-            # PRED history (same color, dashed)
-            ax.plot(
-                obst_pred_traj[:t_idx+1, m, 0],
-                obst_pred_traj[:t_idx+1, m, 1],
-                '--', color=col, lw=1.2, alpha=0.7
-            )
-            # PRED current (circle marker)
-            ax.plot(
-                obst_pred_traj[t_idx, m, 0],
-                obst_pred_traj[t_idx, m, 1],
-                'o', color=col, ms=5, alpha=0.8
-            )
-
-    def common_setup(ax, t_idx):
+    def _setup_ax(ax: plt.Axes, title: str):
         ax.set_xlim(0, box)
         ax.set_ylim(0, box)
-        ax.set_aspect('equal')
-        # agent history & current
-        ax.plot(agent_traj[:t_idx+1, 0], agent_traj[:t_idx+1, 1],
-                'b-', lw=2.0)
-        ax.plot(agent_traj[t_idx, 0], agent_traj[t_idx, 1],
-                'bo', ms=6)
-        plot_obstacles(ax, t_idx)
+        ax.set_aspect("equal", adjustable="box")  # equal 유지하되 subplot 안에서 최대한 채움
+        ax.set_title(title, fontsize=12, pad=4)
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_linewidth(0.8)
+
+    _setup_ax(axs[0, 0], f"TRUE Dist @ target time (H={h})")
+    _setup_ax(axs[0, 1], f"CP lower @ target time (H={h})")
+    _setup_ax(axs[1, 0], "TRUE Unsafe (red)")
+    _setup_ax(axs[1, 1], "Unsafe: CP (light) vs TRUE (dark)")
+
+    # --- images created once ---
+    world_extent = [0, box, 0, box]
+    im_true = axs[0, 0].imshow(true_fields_ego[0], extent=world_extent, origin="lower",
+                               interpolation="nearest", zorder=0)
+    im_low  = axs[0, 1].imshow(lower_fields_ego[0], extent=world_extent, origin="lower",
+                               interpolation="nearest", zorder=0)
+
+    im_mask_true = axs[1, 0].imshow((true_fields_ego[0] < safe_threshold).astype(np.float32),
+                                    extent=world_extent, origin="lower",
+                                    cmap=cmap_warn, vmin=0, vmax=1,
+                                    alpha=0.75, interpolation="nearest", zorder=0)
+
+    im_overlay_true = axs[1, 1].imshow((true_fields_ego[0] < safe_threshold).astype(np.float32),
+                                       extent=world_extent, origin="lower",
+                                       cmap="Blues", vmin=0, vmax=1,
+                                       alpha=0.40, interpolation="nearest", zorder=0)
+    im_overlay_cp   = axs[1, 1].imshow((lower_fields_ego[0] < safe_threshold).astype(np.float32),
+                                       extent=world_extent, origin="lower",
+                                       cmap="Reds", vmin=0, vmax=1,
+                                       alpha=0.50, interpolation="nearest", zorder=1)
+
+    # --- agent lines/point per subplot ---
+    agent_lines = []
+    agent_pts = []
+    for ax in axs.flat:
+        ln, = ax.plot([], [], "b-", lw=2.2, zorder=2)
+        pt, = ax.plot([], [], "bo", ms=6, zorder=3)
+        agent_lines.append(ln)
+        agent_pts.append(pt)
+
+    # --- obstacle true/pred lines & markers per subplot and per obstacle ---
+    obst_true_lines = [[None]*M for _ in range(4)]
+    obst_pred_lines = [[None]*M for _ in range(4)]
+    obst_true_pts   = [[None]*M for _ in range(4)]
+    obst_pred_pts   = [[None]*M for _ in range(4)]
+
+    for k, ax in enumerate(axs.flat):
+        for m in range(M):
+            col = colors[m]
+            lt, = ax.plot([], [], "-",  color=col, lw=1.6, alpha=0.95, zorder=2)
+            lp, = ax.plot([], [], "--", color=col, lw=1.3, alpha=0.75, zorder=2)
+            pt_t, = ax.plot([], [], "x", color=col, ms=8, mew=2.2, zorder=3)
+            pt_p, = ax.plot([], [], "o", color=col, ms=5, alpha=0.85, zorder=3)
+            obst_true_lines[k][m] = lt
+            obst_pred_lines[k][m] = lp
+            obst_true_pts[k][m]   = pt_t
+            obst_pred_pts[k][m]   = pt_p
 
     def update(t):
-        # t는 target time index (0,...,T-1)
-        for ax in axs.flat:
-            ax.cla()
+        t = int(t)
 
-        # ---------------------
-        # (0,0) TRUE distance
-        # ---------------------
-        ax1 = axs[0, 0]
-        common_setup(ax1, t)
-        ax1.imshow(
-            true_fields_ego[t],
-            extent=[0, box, 0, box],
-            origin='lower'
-        )
-        ax1.set_title(f"TRUE Dist @ target time (H={h})")
+        # --- update images ---
+        im_true.set_data(true_fields_ego[t])
+        im_low.set_data(lower_fields_ego[t])
 
-        # ---------------------
-        # (0,1) CP lower
-        # ---------------------
-        ax2 = axs[0, 1]
-        common_setup(ax2, t)
-        ax2.imshow(
-            lower_fields_ego[t],
-            extent=[0, box, 0, box],
-            origin='lower'
-        )
-        ax2.set_title(f"CP lower @ target time (H={h})")
+        mask_true = (true_fields_ego[t] < safe_threshold).astype(np.float32)
+        mask_cp   = (lower_fields_ego[t] < safe_threshold).astype(np.float32)
+        im_mask_true.set_data(mask_true)
+        im_overlay_true.set_data(mask_true)
+        im_overlay_cp.set_data(mask_cp)
 
-        # ---------------------
-        # (1,0) TRUE unsafe mask
-        # ---------------------
-        ax3 = axs[1, 0]
-        common_setup(ax3, t)
-        mask_true = (true_fields_ego[t] < safe_threshold).astype(float)
-        ax3.imshow(
-            mask_true,
-            extent=[0, box, 0, box],
-            origin='lower',
-            cmap=cmap_warn,
-            vmin=0, vmax=1,
-            alpha=0.7
-        )
-        ax3.set_title("TRUE Unsafe (red)")
+        # --- update agent ---
+        ax_x = agent_traj[:t+1, 0]
+        ax_y = agent_traj[:t+1, 1]
+        for k in range(4):
+            agent_lines[k].set_data(ax_x, ax_y)
+            agent_pts[k].set_data([agent_traj[t, 0]], [agent_traj[t, 1]])
 
-        # ---------------------
-        # (1,1) TRUE vs CP unsafe
-        # ---------------------
-        ax4 = axs[1, 1]
-        common_setup(ax4, t)
-        # TRUE (blue)
-        ax4.imshow(
-            mask_true,
-            extent=[0, box, 0, box],
-            origin='lower',
-            cmap="Blues",
-            vmin=0, vmax=1,
-            alpha=0.4
-        )
-        # CP (red)
-        mask_cp = (lower_fields_ego[t] < safe_threshold).astype(float)
-        ax4.imshow(
-            mask_cp,
-            extent=[0, box, 0, box],
-            origin='lower',
-            cmap="Reds",
-            vmin=0, vmax=1,
-            alpha=0.5
-        )
-        ax4.set_title("Unsafe: CP (red) vs TRUE (blue)")
+        # --- update obstacles ---
+        for k in range(4):
+            for m in range(M):
+                obst_true_lines[k][m].set_data(obst_traj[:t+1, m, 0], obst_traj[:t+1, m, 1])
+                obst_pred_lines[k][m].set_data(obst_pred_traj[:t+1, m, 0], obst_pred_traj[:t+1, m, 1])
 
-    ani = FuncAnimation(fig, update, frames=range(T),
-                        blit=False, interval=interval)
+                obst_true_pts[k][m].set_data([obst_traj[t, m, 0]], [obst_traj[t, m, 1]])
+                obst_pred_pts[k][m].set_data([obst_pred_traj[t, m, 0]], [obst_pred_traj[t, m, 1]])
+
+        axs[0, 0].set_title(f"TRUE Dist @ target time (H={h}, t={t})", pad=8)
+        axs[0, 1].set_title(f"CP lower @ target time (H={h}, t={t})", pad=8)
+
+        # return list of artists (blit=False라 필수는 아니지만 깔끔)
+        arts = [im_true, im_low, im_mask_true, im_overlay_true, im_overlay_cp]
+        arts += agent_lines + agent_pts
+        for k in range(4):
+            for m in range(M):
+                arts += [obst_true_lines[k][m], obst_pred_lines[k][m],
+                         obst_true_pts[k][m], obst_pred_pts[k][m]]
+        return arts
+
+    fig.subplots_adjust(left=0.03, right=0.97, top=0.93, bottom=0.04,
+                        wspace=0.07, hspace=0.10)
+
+    ani = FuncAnimation(fig, update, frames=range(T), blit=False, interval=interval)
     return ani

@@ -37,7 +37,7 @@ class CPConfig:
     """
     p_base: int = 3
     K: int = 4
-    alpha: float = 0.05
+    alpha: float = 0.01
     test_size: float = 0.30
     random_state: int = 0
     n_jobs: int = 1
