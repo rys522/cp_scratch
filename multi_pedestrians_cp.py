@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 from preprocess import load_eth_pickle_preprocessed
 from cp.functional_cp import compute_cp_upper_envelopes
-from utils import build_grid, reflect_vectorized, animate_cp_comparison_multi, distance_field_points
+from utils import build_grid, reflect_vectorized, animate_cp_comparison_multi, distance_field_points, render_cp_comparison_paper_multi
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -369,7 +369,7 @@ def main():
                 f = np.minimum(f, d)
         true_fields[t] = f
 
-    ani = animate_cp_comparison_multi(
+    ani = render_cp_comparison_paper_multi(
         agent_traj=agent_vis,
         obst_traj=obst_vis_true,
         obst_pred_traj=obst_vis_pred,
@@ -382,7 +382,6 @@ def main():
         headings=None,
         interval=150,
     )
-    ani.save("cp.mp4", fps=5, dpi=200, bitrate=4000)
     plt.show()
 
 

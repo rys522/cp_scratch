@@ -2,7 +2,7 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from typing import Optional
+from typing import Optional, Tuple, Sequence
 from matplotlib.transforms import Affine2D
 
 
@@ -165,6 +165,7 @@ def world_to_ego(points: np.ndarray, agent_xy: np.ndarray, align_heading=False, 
         else:
             rel = rel @ R.T
     return rel
+
 
 
 # ---------------------------
@@ -427,3 +428,170 @@ def animate_cp_comparison_multi(
 
     ani = FuncAnimation(fig, update, frames=range(T), blit=False, interval=interval)
     return ani
+
+
+def set_mpl_latex_style():
+    """
+    Matplotlib style that matches LaTeX (Computer Modern).
+    Intended for paper-quality figures.
+    """
+
+    plt.rcParams.update({
+        # Use LaTeX for all text rendering
+        "text.usetex": True,
+
+        # Font family
+        "font.family": "serif",
+        "font.serif": ["Computer Modern Roman"],
+
+        # Font sizes (paper-friendly)
+        "font.size": 8,
+        "axes.titlesize": 9,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 7,
+        "ytick.labelsize": 7,
+        "legend.fontsize": 7,
+
+        # Line aesthetics
+        "axes.linewidth": 0.7,
+        "lines.linewidth": 1.1,
+        "lines.markersize": 4,
+
+        # Figure quality
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+    })
+
+def render_cp_comparison_paper_multi(
+    agent_traj: np.ndarray,
+    obst_traj: np.ndarray,
+    obst_pred_traj: np.ndarray,
+    true_fields_ego: np.ndarray,
+    lower_fields_ego: np.ndarray,
+    box: float,
+    ego_box: float,                 # signature compatibility (not used here)
+    safe_threshold: float,
+    h: int,
+    headings: np.ndarray = None,     # signature compatibility (optional)
+    interval: int = 150,             # signature compatibility (not used here)
+    *,
+    t: Optional[int] = None,         # frame index to render (default: middle)
+    use_target_time: bool = True,    # if True: render at t+h; else at t
+    show_points: bool = True,        # robot/obstacle markers
+    show_safe_contour: bool = True,  # plot D(x)=r_safe contour
+    cmap: str = "viridis",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    dpi: int = 300,
+    figsize: Tuple[float, float] = (6.8, 2.8),
+    savepath: Optional[str] = None,
+) -> Tuple[plt.Figure, Sequence[plt.Axes]]:
+    """
+    Paper-ready static figure (2 panels): True SDF vs CP lower SDF.
+
+    This is a drop-in *call-style compatible* companion to
+    `animate_cp_comparison_multi(...)`, but returns a static figure
+    for papers instead of an animation.
+
+    Parameters are intentionally similar to the animation function for convenience.
+    """
+
+    set_mpl_latex_style()
+
+    # -----------------------------
+    # Normalize obstacle shapes
+    # -----------------------------
+    if obst_traj.ndim == 2:
+        obst_traj = obst_traj[:, np.newaxis, :]
+    if obst_pred_traj.ndim == 2:
+        obst_pred_traj = obst_pred_traj[:, np.newaxis, :]
+
+    T = min(agent_traj.shape[0], obst_traj.shape[0], obst_pred_traj.shape[0],
+            true_fields_ego.shape[0], lower_fields_ego.shape[0])
+
+    if T <= 0:
+        raise ValueError("Empty trajectories/fields (T <= 0).")
+
+    # Choose t if not provided
+    if t is None:
+        t = max(0, (T // 2) - (h if use_target_time else 0))
+
+    t = int(np.clip(t, 0, T - 1))
+    tph = t + h if use_target_time else t
+    if tph >= T:
+        raise ValueError(f"Requested target time t+h={tph} exceeds available T={T}.")
+
+    # Fields to render
+    F_true = true_fields_ego[tph]
+    F_cp   = lower_fields_ego[tph]
+
+    # -----------------------------
+    # Shared color scale
+    # -----------------------------
+    if vmin is None or vmax is None:
+        stacked = np.stack([F_true, F_cp], axis=0)
+        if vmin is None:
+            vmin = float(np.nanpercentile(stacked, 1.0))
+        if vmax is None:
+            vmax = float(np.nanpercentile(stacked, 99.0))
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+
+    # -----------------------------
+    # Figure
+    # -----------------------------
+    fig, axes = plt.subplots(1, 2, figsize=figsize, dpi=dpi, constrained_layout=True)
+    ax0, ax1 = axes
+    extent = [0.0, float(box), 0.0, float(box)]
+
+    im0 = ax0.imshow(F_true, origin="lower", extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
+    im1 = ax1.imshow(F_cp,   origin="lower", extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
+
+    # -----------------------------
+    # Optional: safety contour D(x)=r_safe
+    # -----------------------------
+    if show_safe_contour and (safe_threshold is not None):
+        Hh, Ww = F_true.shape
+        xs = np.linspace(0.0, box, Ww)
+        ys = np.linspace(0.0, box, Hh)
+        X, Y = np.meshgrid(xs, ys)
+        for ax, F in [(ax0, F_true), (ax1, F_cp)]:
+            ax.contour(X, Y, F, levels=[safe_threshold], linestyles="--", linewidths=1.2)
+
+    # -----------------------------
+    # Optional: markers (robot + obstacles)
+    # -----------------------------
+    if show_points:
+        robot_xy = agent_traj[tph]
+        obst_xy  = obst_traj[tph]  # (M,2)
+        for ax in (ax0, ax1):
+            ax.plot(robot_xy[0], robot_xy[1], "o", ms=3.5)
+            ax.plot(obst_xy[:, 0], obst_xy[:, 1], "x", ms=4.0, mew=1.2)
+
+            ax.contour(X, Y, F, levels=[safe_threshold],
+                    linestyles="--", linewidths=1.0)
+
+    # -----------------------------
+    # Formatting
+    # -----------------------------
+    ax0.set_title(r"\textbf{True SDF}", pad=3)
+    ax1.set_title(r"\textbf{Conformal lower bound}", pad=3)
+
+    for ax in (ax0, ax1):
+        ax.set_xlim(0, box)
+        ax.set_ylim(0, box)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_linewidth(0.8)
+
+    # One shared colorbar
+    cbar = fig.colorbar(im1, ax=axes, fraction=0.046, pad=0.02)
+    cbar.ax.tick_params(labelsize=9)
+    cbar.set_label(r"Distance", fontsize=8)
+
+    if savepath is not None:
+        fig.savefig(savepath, bbox_inches="tight", pad_inches=0.02)
+
+    return fig, axes
