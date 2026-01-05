@@ -1,297 +1,447 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+import pickle
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-# Local module imports
-from preprocess import load_eth_pickle_preprocessed
-from cp.functional_cp import compute_cp_upper_envelopes, get_envelopes_function, CPStepParameters
-from controllers.func_cp_mpc import FunctionalCPMPC
-
 from utils import build_grid, distance_field_points
 from sims.sim_utils import (
-    build_cv_predictions,
     compute_lower_field_single_step,
     min_dist_robot_to_peds,
-    align_mask_dims,
     unicycle_step,
-    reflect_to_box_xy,
-    make_cv_prediction_from_two_points,
 )
+from cp.functional_cp import get_envelopes_value_and_function, CPStepParameters
+from controllers.func_cp_mpc import FunctionalCPMPC
+from controllers.func_cp_potential import FunctionalCPFieldController
 
 
 # ==============================================================================
-# 0. Config
+# 0) Constants (aligned to your main runner)
 # ==============================================================================
 
-@dataclass(frozen=True)
-class SimConfig:
-    base_dir: str
-    dataset: str = "univ"
+DT = 0.4
 
-    # grid / world
-    H: int = 128
-    W: int = 128
-    box: float = 100.0
+ROBOT_RAD = 0.4
+OBSTACLE_RAD = 1.0 / np.sqrt(2.0)
 
-    # sequence
-    TSTEPS: int = 20
-    TIME_HORIZON: int = 20
-    mpc_dt: float = 0.1
+MAX_LINEAR_X = 0.8
+MIN_LINEAR_X = -0.8
+MAX_ANGULAR_Z = 0.7
+MIN_ANGULAR_Z = -0.7
 
-    # CP calibration
-    seed: int = 2021
-    n_train: int = 1000
-    num_peds: int = 20
-    p_base: int = 3
-    k_mix: int = 5
-    alpha: float = 0.05
-    test_size: float = 0.30
-    random_state: int = 0
-    n_jobs: int = max(1, (os.cpu_count() or 4) - 2)
-    backend: str = "loky"
+EVAL_TASK_CONFIGS = {
+    "zara1": {"init_robot_pose": np.array([12.0, 5.0, np.pi], dtype=np.float32), "goal_pos": np.array([3.0, 6.0], dtype=np.float32)},
+    "zara2": {"init_robot_pose": np.array([1.0, 6.0, 0.0], dtype=np.float32), "goal_pos": np.array([14.0, 5.0], dtype=np.float32)},
+    "hotel": {"init_robot_pose": np.array([-1.5, 0.0, -np.pi / 2.0], dtype=np.float32), "goal_pos": np.array([2.0, -6.0], dtype=np.float32)},
+    "eth":   {"init_robot_pose": np.array([5.0, 1.0, np.pi / 2.0], dtype=np.float32), "goal_pos": np.array([3.0, 10.0], dtype=np.float32)},
+    "univ":  {"init_robot_pose": np.array([3.5, 2.0, np.pi / 4.0], dtype=np.float32), "goal_pos": np.array([11.5, 8.5], dtype=np.float32)},
+}
 
-    # controller
-    n_skip: int = 4
-    n_paths: int = 1200
-    robot_rad: float = 0.4
-    obstacle_rad: float = 1.0 / np.sqrt(2.0)
-    hard_cp_constraint: bool = True
-    w_cp_violation: float = 200.0
+SCENARIOS = {
+    "zara1": [100, 200, 300],
+    "zara2": [100, 200, 300],
+    "eth": [100, 200, 300],
+    "hotel": [100, 200, 300],
+    "univ": [100],
+}
 
-    # misc
-    goal_reach_threshold: float = 2.0
-    init_robot_xy: Tuple[float, float] = (10.0, 10.0)
-    init_robot_th: float = 0.0
-    goal_xy: Tuple[float, float] = (90.0, 90.0)
+INIT_FRAMES = {
+    "zara1": 0,
+    "zara2": 1,
+    "eth": 78,
+    "hotel": 0,
+    "univ": 0,
+}
 
-    @property
-    def world_center(self) -> np.ndarray:
-        return np.array([self.box / 2.0, self.box / 2.0], dtype=np.float32)
+MAX_N_STEPS = {
+    "zara1": 100,
+    "zara2": 100,
+    "eth": 100,
+    "hotel": 100,
+    "univ": 300,
+}
 
 
 # ==============================================================================
-# 1. Utility: residual construction
+# 1) PKL loader (same convention as your main runner)
 # ==============================================================================
 
-def build_training_residuals_valid_only(
-    obst_true: np.ndarray,
-    obst_pred: np.ndarray,
-    masks: np.ndarray,
+def load_prediction_results(dataset: str) -> dict:
+    pkl_path = os.path.join(os.path.dirname(__file__), "predictions", f"{dataset}.pkl")
+    if not os.path.isfile(pkl_path):
+        raise FileNotFoundError(f"PKL not found: {pkl_path}")
+    with open(pkl_path, "rb") as f:
+        res = pickle.load(f)
+    for k in ("prediction", "history", "future"):
+        if k not in res:
+            raise ValueError(f"PKL is missing key '{k}'")
+    return res
+
+
+# ==============================================================================
+# 2) World bounds inference from PKL (CRITICAL FIX)
+# ==============================================================================
+
+def _collect_points_for_bounds(
+    pred_all: dict,
+    hist_all: dict,
+    scenario_begin: int,
+    n_steps: int,
+    horizon: int,
+    init_pose: np.ndarray,
+    goal: np.ndarray,
+) -> np.ndarray:
+    pts = [init_pose[:2][None, :], goal[None, :]]
+
+    for k in range(n_steps):
+        ts_key = scenario_begin + k
+
+        if ts_key in hist_all:
+            for traj in hist_all[ts_key].values():
+                arr = np.asarray(traj, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] > 0:
+                    pts.append(arr[-1:])
+
+        if ts_key in pred_all:
+            for pred_traj in pred_all[ts_key].values():
+                arr = np.asarray(pred_traj, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] > 0:
+                    take = min(horizon, arr.shape[0])
+                    pts.append(arr[:take])
+
+    return np.vstack(pts) if len(pts) > 0 else np.zeros((0, 2), dtype=np.float32)
+
+
+def _infer_world(points_xy: np.ndarray, margin: float = 2.0):
+    if points_xy.size == 0:
+        world_center = np.array([0.0, 0.0], dtype=np.float32)
+        box = 20.0
+        bounds = (-10.0, 10.0, -10.0, 10.0)
+        return world_center, box, bounds
+
+    xmin = float(np.min(points_xy[:, 0])) - margin
+    xmax = float(np.max(points_xy[:, 0])) + margin
+    ymin = float(np.min(points_xy[:, 1])) - margin
+    ymax = float(np.max(points_xy[:, 1])) + margin
+
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+
+    xspan = xmax - xmin
+    yspan = ymax - ymin
+    box = float(max(xspan, yspan))  # make square for grid
+
+    world_center = np.array([cx, cy], dtype=np.float32)
+    return world_center, box, (xmin, xmax, ymin, ymax)
+
+
+# ==============================================================================
+# 3) Offline calibration from file: build residual tensor (N, H, Hg, Wg)
+#    (Already aligned to reference: pred[i] <-> future[i])
+# ==============================================================================
+
+def build_training_residuals_from_file(
+    all_data_dict: dict,
+    scene_ids: List[int],
     Xg: np.ndarray,
     Yg: np.ndarray,
     world_center: np.ndarray,
-    horizon: int,
-) -> Tuple[np.ndarray, int]:
+    time_horizon: int,
+) -> np.ndarray:
     """
-    Returns:
-      residuals: (N_eff, T_eff, H, W)
-      t_offset: int
+    Build residual tensor using MIN-over-pedestrians SDF residual:
+
+        S_i(x) = D_pred_i(x) - D_true_i(x)
+              = min_m ||x - yhat_i^m|| - min_m ||x - y_i^m||
+
+    Returns: (N_scenes, H, Hg, Wg)
     """
-    if obst_true.ndim == 3:
-        obst_true, obst_pred, masks = obst_true[:, :, None, :], obst_pred[:, :, None, :], masks[:, :, None]
+    pred_dict = all_data_dict["prediction"]
+    fut_dict = all_data_dict["future"]
 
-    N, T, M, _ = obst_true.shape
-    t_offset = horizon + 1
-    T_eff = T - t_offset
+    Hh = int(time_horizon)
+    Hg, Wg = Xg.shape
 
-    residuals = []
-    for n in range(N):
-        for m in range(M):
-            if not np.all(masks[n, t_offset:, m]):
+    residuals: List[np.ndarray] = []
+
+    for sid in scene_ids:
+        if sid not in pred_dict or sid not in fut_dict:
+            continue
+
+        p_scene = pred_dict[sid]  # {pid: (H,2)}
+        f_scene = fut_dict[sid]   # {pid: (H,2)}
+
+        # Use only peds that exist in both pred & GT
+        pids = [pid for pid in p_scene.keys() if pid in f_scene]
+        if len(pids) == 0:
+            continue
+
+        res_i = np.zeros((Hh, Hg, Wg), dtype=np.float32)
+
+        last_valid_i: Optional[int] = None
+
+        for i in range(Hh):
+            pred_pts = []
+            true_pts = []
+
+            for pid in pids:
+                y_pred_traj = np.asarray(p_scene[pid], dtype=np.float32)
+                y_true_traj = np.asarray(f_scene[pid], dtype=np.float32)
+
+                # sanity
+                if y_pred_traj.ndim != 2 or y_pred_traj.shape[1] != 2:
+                    continue
+                if y_true_traj.ndim != 2 or y_true_traj.shape[1] != 2:
+                    continue
+                if i >= y_pred_traj.shape[0] or i >= y_true_traj.shape[0]:
+                    continue
+
+                pred_pts.append(y_pred_traj[i])
+                true_pts.append(y_true_traj[i])
+
+            # If no valid peds at this horizon step, hold previous residual (or zeros if first)
+            if len(pred_pts) == 0 or len(true_pts) == 0:
+                if last_valid_i is not None:
+                    res_i[i] = res_i[last_valid_i]
+                else:
+                    res_i[i] = 0.0
                 continue
-            res = np.zeros((T_eff, Xg.shape[0], Xg.shape[1]), dtype=np.float32)
-            for t in range(T_eff):
-                y_true = obst_true[n, t + t_offset, m] - world_center
-                y_pred = obst_pred[n, t + t_offset, m] - world_center
-                res[t] = distance_field_points(y_pred, Xg, Yg) - distance_field_points(y_true, Xg, Yg)
-            residuals.append(res)
+
+            pred_pts = (np.asarray(pred_pts, dtype=np.float32) - world_center)  # (M,2)
+            true_pts = (np.asarray(true_pts, dtype=np.float32) - world_center)  # (M,2)
+
+            # MIN-over-peds distance field
+            sdf_pred = distance_field_points(pred_pts, Xg, Yg)  # (Hg,Wg)
+            sdf_true = distance_field_points(true_pts, Xg, Yg)  # (Hg,Wg)
+
+            res_i[i] = sdf_pred - sdf_true
+            last_valid_i = i
+
+        residuals.append(res_i)
 
     if len(residuals) == 0:
-        raise RuntimeError("No valid residual trajectories were collected (mask filtering too strict?).")
+        raise RuntimeError("No valid residual samples built from file. (Check PKL contents.)")
 
-    return np.stack(residuals, axis=0), t_offset
-
-
-# ==============================================================================
-# 2. Data + Calibration
-# ==============================================================================
-
-def prepare_data(cfg: SimConfig):
-    train_data = load_eth_pickle_preprocessed(
-        dataset=cfg.dataset,
-        box=cfg.box,
-        T=cfg.TSTEPS,
-        split_ratio=0.8,
-        seed=cfg.seed,
-        base_dir=cfg.base_dir,
-        num_peds=cfg.num_peds,
-    )
-    train_true_raw, _, train_mask, test_true_raw, _, test_mask = train_data
-
-    # -> (N, T, M, 2)
-    train_true = np.transpose(train_true_raw, (0, 2, 1, 3))
-    test_true = np.transpose(test_true_raw, (0, 2, 1, 3))
-    train_mask = align_mask_dims(train_mask, cfg.TSTEPS, cfg.num_peds)
-    test_mask = align_mask_dims(test_mask, cfg.TSTEPS, cfg.num_peds)
-
-    return train_true, train_mask, test_true, test_mask
+    return np.stack(residuals, axis=0)
 
 
-def calibrate_cp(cfg: SimConfig, train_true: np.ndarray, train_mask: np.ndarray, Xg: np.ndarray, Yg: np.ndarray):
-    """
-    Outputs:
-      g_upper_grid: (T_eff, H, W) grid envelope (for visualization / debugging)
-      cp_params:    List[CPStepParameters] (for controller online evaluation)
-    """
-    rng = np.random.default_rng(cfg.seed)
-    idx = rng.choice(train_true.shape[0], size=min(cfg.n_train, train_true.shape[0]), replace=False)
-
-    train_pred_sel = build_cv_predictions(train_true[idx], cfg.box, horizon=1)
-    residuals, _ = build_training_residuals_valid_only(
-        obst_true=train_true[idx],
-        obst_pred=train_pred_sel,
-        masks=train_mask[idx],
+def calibrate_cp_from_file(
+    *,
+    all_data: dict,
+    Xg: np.ndarray,
+    Yg: np.ndarray,
+    world_center: np.ndarray,
+    time_horizon: int,
+    p_base: int,
+    k_mix: int,
+    alpha: float,
+    test_size: float,
+    random_state: int,
+    n_jobs: int,
+    backend: str,
+) -> Tuple[np.ndarray, List[CPStepParameters]]:
+    all_scenes = sorted(list(all_data["prediction"].keys()))
+    residuals = build_training_residuals_from_file(
+        all_data_dict=all_data,
+        scene_ids=all_scenes,
         Xg=Xg,
         Yg=Yg,
-        world_center=cfg.world_center,
-        horizon=1,
+        world_center=world_center,
+        time_horizon=time_horizon,
     )
 
-    print("Calibrating CP envelopes...")
+    print(f"[offline] residual tensor: {residuals.shape} (N_samples, H, Hg, Wg)")
+    print("[offline] calibrating CP envelopes...")
 
-    g_upper_ds = compute_cp_upper_envelopes(
+    g_upper_grid, cp_params = get_envelopes_value_and_function(
         residuals_train=residuals,
-        p_base=cfg.p_base,
-        K=cfg.k_mix,
-        alpha=cfg.alpha,
-        test_size=cfg.test_size,
-        random_state=cfg.random_state,
-        n_jobs=cfg.n_jobs,
-        backend=cfg.backend,
+        p_base=p_base,
+        K=k_mix,
+        alpha=alpha,
+        test_size=test_size,
+        random_state=random_state,
+        n_jobs=n_jobs,
+        backend=backend,
     )
-
-    cp_params = get_envelopes_function(
-        residuals_train=residuals,
-        p_base=cfg.p_base,
-        K=cfg.k_mix,
-        alpha=cfg.alpha,
-        test_size=cfg.test_size,
-        random_state=cfg.random_state,
-        n_jobs=cfg.n_jobs,
-        backend=cfg.backend,
-    )
-
-    # --- pad / crop to TIME_HORIZON for convenience ---
-    g_upper_grid = pad_or_crop_time(g_upper_ds, cfg.TIME_HORIZON)
-    cp_params = pad_or_crop_params(cp_params, cfg.TIME_HORIZON)
 
     return g_upper_grid.astype(np.float32), cp_params
 
 
-def pad_or_crop_time(arr: np.ndarray, T: int) -> np.ndarray:
-    if arr.shape[0] >= T:
-        return arr[:T]
-    pad = np.repeat(arr[-1][None], T - arr.shape[0], axis=0)
-    return np.concatenate([arr, pad], axis=0)
+# ==============================================================================
+# 4) Helpers: controller input from PKL prediction dict
+# ==============================================================================
+
+def stack_pred_from_p_dict(p_dict: Dict, horizon: int) -> Tuple[np.ndarray, np.ndarray, List]:
+    # p_dict[pid][i] is prediction at (t+1+i) in reference convention
+    pids = list(p_dict.keys())
+    M = len(pids)
+    Hh = int(horizon)
+
+    pred = np.zeros((Hh, M, 2), dtype=np.float32)
+    mask = np.zeros((Hh, M), dtype=bool)
+
+    for j, pid in enumerate(pids):
+        arr = np.asarray(p_dict[pid], dtype=np.float32)
+        take = min(Hh, arr.shape[0])
+        if take > 0:
+            pred[:take, j] = arr[:take]
+            mask[:take, j] = True
+
+    return pred, mask, pids
 
 
-def pad_or_crop_params(params: List[CPStepParameters], T: int) -> List[CPStepParameters]:
-    if len(params) >= T:
-        return params[:T]
-    if len(params) == 0:
-        raise ValueError("cp_params is empty.")
-    last = params[-1]
-    out = list(params)
-    for t in range(len(params), T):
-        # 같은 파라미터로 t_idx만 바꿔서 padding (보수적/실용적)
-        out.append(CPStepParameters(
-            t_idx=t,
-            mean_field=last.mean_field,
-            phi_basis=last.phi_basis,
-            epsilon=last.epsilon,
-            mus=last.mus,
-            sigmas=last.sigmas,
-            rks=last.rks,
-            K=last.K,
-            p_eff=last.p_eff,
-        ))
-    return out
+def get_current_obs_from_history(h_dict: Dict) -> np.ndarray:
+    # h_dict[pid][-1] is observation at current time t
+    if len(h_dict) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.asarray([traj[-1] for traj in h_dict.values()], dtype=np.float32)
+
+
+def get_future_obs_from_future_dict(f_dict: Dict, i_view: int) -> np.ndarray:
+    """
+    Reference-aligned 'true' positions for comparison with pred[i_view]:
+        pred[i_view]  ~ y_{t+1+i_view}
+        future[i_view] = y_{t+1+i_view}
+    """
+    if len(f_dict) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    pts = []
+    for pid, traj in f_dict.items():
+        arr = np.asarray(traj, dtype=np.float32)  # (H,2)
+        if arr.ndim == 2 and arr.shape[1] == 2 and i_view < arr.shape[0]:
+            pts.append(arr[i_view])
+    return np.asarray(pts, dtype=np.float32) if len(pts) > 0 else np.zeros((0, 2), dtype=np.float32)
 
 
 # ==============================================================================
-# 3. Controller init
+# 5) One-episode visualization (file-based) with AUTO world/grid
 # ==============================================================================
 
-def init_controller(cfg: SimConfig, cp_params: List[CPStepParameters], obstacle_rad_with_tracking: float):
-    return FunctionalCPMPC(
-        box=cfg.box,
-        world_center=cfg.world_center,
-        cp_params=cp_params,
-        grid_H=cfg.H,   # (컨트롤러가 grid_res 필요하면 유지, 실제론 param eval만 해도 됨)
-        grid_W=cfg.W,
-        n_steps=cfg.TIME_HORIZON,
-        dt=cfg.mpc_dt,
-        n_skip=cfg.n_skip,
-        n_paths=cfg.n_paths,
-        seed=0,
-        robot_rad=cfg.robot_rad,
-        obstacle_rad=obstacle_rad_with_tracking,
-        hard_cp_constraint=cfg.hard_cp_constraint,
-        w_cp_violation=cfg.w_cp_violation,
+def run_one_episode_visual_from_file(
+    dataset: str,
+    *,
+    scenario_idx: int = 0,
+    time_horizon: int = 12,
+    grid_H: int = 16,
+    grid_W: int = 16,
+    alpha: float = 0.05,
+    p_base: int = 4,
+    k_mix: int = 5,
+    test_size: float = 0.30,
+    random_state: int = 0,
+    n_jobs: int = 4,
+    backend: str = "loky",
+    n_skip: int = 4,
+    n_paths: int = 1200,
+    max_steps: Optional[int] = None,
+    max_tracking_error: float = 0.1,
+):
+    if dataset not in EVAL_TASK_CONFIGS:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+    init_robot_pose = EVAL_TASK_CONFIGS[dataset]["init_robot_pose"].copy()
+    goal_pos = EVAL_TASK_CONFIGS[dataset]["goal_pos"].copy()
+    scenario_begin = SCENARIOS[dataset][scenario_idx]
+    _ = INIT_FRAMES[dataset]
+    max_n_steps = MAX_N_STEPS[dataset] if max_steps is None else int(max_steps)
+
+    # Load PKL
+    all_data = load_prediction_results(dataset)
+    pred_all = all_data["prediction"]
+    hist_all = all_data["history"]
+    fut_all = all_data["future"]  # <-- IMPORTANT: use future dict to align time axis
+
+    # --------- AUTO world/grid inference (CRITICAL FIX) ----------
+    points_xy = _collect_points_for_bounds(
+        pred_all=pred_all,
+        hist_all=hist_all,
+        scenario_begin=scenario_begin,
+        n_steps=min(max_n_steps, 200),
+        horizon=time_horizon,
+        init_pose=init_robot_pose,
+        goal=goal_pos,
+    )
+    world_center, box, (xmin, xmax, ymin, ymax) = _infer_world(points_xy, margin=2.0)
+
+    xs, ys, Xg, Yg = build_grid(box, grid_H, grid_W)
+    extent = [
+        xs[0] + world_center[0], xs[-1] + world_center[0],
+        ys[0] + world_center[1], ys[-1] + world_center[1],
+    ]
+
+    print(f"[world] inferred bounds: x=[{xmin:.2f},{xmax:.2f}] y=[{ymin:.2f},{ymax:.2f}]")
+    print(f"[world] inferred box={box:.2f}, world_center={world_center.tolist()}")
+
+    # Offline calibration (same world/grid!)
+    g_upper_grid, cp_params = calibrate_cp_from_file(
+        all_data=all_data,
+        Xg=Xg,
+        Yg=Yg,
+        world_center=world_center,
+        time_horizon=time_horizon,
+        p_base=p_base,
+        k_mix=k_mix,
+        alpha=alpha,
+        test_size=test_size,
+        random_state=random_state,
+        n_jobs=n_jobs,
+        backend=backend,
     )
 
+    # Controller init (use inferred box/world_center)
+    ctrl = FunctionalCPMPC(
+        cp_params=cp_params,
+        box=box,
+        world_center=world_center,
+        n_steps=time_horizon,
+        dt=DT,
+        n_skip=n_skip,
+        robot_rad=ROBOT_RAD,
+        obstacle_rad=OBSTACLE_RAD,
+        min_linear_x=MIN_LINEAR_X,
+        max_linear_x=MAX_LINEAR_X,
+        min_angular_z=MIN_ANGULAR_Z,
+        max_angular_z=MAX_ANGULAR_Z,
+        n_paths=n_paths,
+        seed=0,
+        grid_H=grid_H,
+        grid_W=grid_W,
+    )
 
-# ==============================================================================
-# 4. Visualization harness (1 episode)
-# ==============================================================================
+    robot_xy = init_robot_pose[:2].astype(np.float32)
+    robot_th = float(init_robot_pose[2])
+    goal = goal_pos.astype(np.float32)
 
-def run_one_episode_visual(cfg: SimConfig):
-    # --- data ---
-    train_true, train_mask, test_true, test_mask = prepare_data(cfg)
-    xs, ys, Xg, Yg = build_grid(cfg.box, cfg.H, cfg.W)
-
-    # --- calibration ---
-    g_upper_grid, cp_params = calibrate_cp(cfg, train_true, train_mask, Xg, Yg)
-
-    # --- pick episode ---
-    rng = np.random.default_rng(cfg.seed)
-    ep = int(rng.integers(test_true.shape[0]))
-    obst_ep, mask_ep = test_true[ep], test_mask[ep]
-
-    # --- controller ---
-    max_tracking_error = 0.05
-    ctrl = init_controller(cfg, cp_params, obstacle_rad_with_tracking=cfg.obstacle_rad + max_tracking_error)
-
-    # --- state ---
-    robot_xy = np.array(cfg.init_robot_xy, dtype=np.float32)
-    robot_th = float(cfg.init_robot_th)
-    goal = np.array(cfg.goal_xy, dtype=np.float32)
     robot_traj = [robot_xy.copy()]
-    planned_next_xy: Optional[np.ndarray] = None
+    collision_count = 0
+    infeasible_count = 0
 
-    # --- plot ---
     fig, axs = plt.subplots(1, 2, figsize=(14, 7), constrained_layout=True)
-    extent = [xs[0] + cfg.world_center[0], xs[-1] + cfg.world_center[0],
-              ys[0] + cfg.world_center[1], ys[-1] + cfg.world_center[1]]
 
-    im_heat = axs[0].imshow(np.zeros((cfg.H, cfg.W)), extent=extent, origin="lower", vmin=0, vmax=10)
+    im_heat = axs[0].imshow(
+        np.zeros((grid_H, grid_W), dtype=np.float32),
+        extent=extent,
+        origin="lower",
+        cmap="viridis_r",
+        vmin=0,
+        vmax=10,
+    )
     plt.colorbar(im_heat, ax=axs[0], fraction=0.046, pad=0.04)
     axs[0].set_title("CP lower-bound field (grid viz only)")
 
-    axs[1].set_title(f"Unsafe region: True vs CP (alpha={cfg.alpha})")
-    im_true = axs[1].imshow(np.zeros((cfg.H, cfg.W)), extent=extent, origin="lower", vmin=0, vmax=1, alpha=0.4)
-    im_cp = axs[1].imshow(np.zeros((cfg.H, cfg.W)), extent=extent, origin="lower", vmin=0, vmax=1, alpha=0.5)
+    axs[1].set_title(f"Unsafe region: True vs CP (alpha={alpha})")
+    im_true = axs[1].imshow(np.zeros((grid_H, grid_W)), extent=extent, origin="lower", cmap="Blues", vmin=0, vmax=1, alpha=0.4)
+    im_cp = axs[1].imshow(np.zeros((grid_H, grid_W)), extent=extent, origin="lower", cmap="Reds", vmin=0, vmax=1, alpha=0.5)
 
-    robot_dots, traj_lines, plan_lines, peds_scatters = [], [], [], []
+    robot_dots, traj_lines, plan_lines, peds_scatters, pred_scatters = [], [], [], [], []
     for ax in axs:
-        ax.set_xlim(0, cfg.box)
-        ax.set_ylim(0, cfg.box)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
         ax.set_aspect("equal")
         ax.plot(goal[0], goal[1], "gx", ms=12, mew=2)
 
@@ -299,119 +449,159 @@ def run_one_episode_visual(cfg: SimConfig):
         line, = ax.plot([], [], "b-", lw=1, alpha=0.5)
         plan_p, = ax.plot([], [], "c--", lw=1.5, zorder=4)
         peds = ax.scatter([], [], s=25, edgecolors="black", zorder=6)
+        pred_sc = ax.scatter([], [], s=40, marker="x", zorder=7)
 
         robot_dots.append(dot)
         traj_lines.append(line)
         plan_lines.append(plan_p)
         peds_scatters.append(peds)
+        pred_scatters.append(pred_sc)
 
     status_text = fig.text(0.5, 0.02, "", ha="center", fontsize=10, fontweight="bold")
 
-    collision_count = 0
-    infeasible_count = 0
-
     def update(k: int):
-        nonlocal robot_xy, robot_th, planned_next_xy, max_tracking_error, collision_count, infeasible_count
+        nonlocal robot_xy, robot_th, collision_count, infeasible_count, max_tracking_error
 
-        t = k + 1
+        ts_key = scenario_begin + k
+        if ts_key not in pred_all or ts_key not in hist_all or ts_key not in fut_all:
+            status_text.set_text(
+                f"Ended | timestep={k} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
+            )
+            status_text.set_color("red")
+            anim.event_source.stop()
+            return []
 
-        # (A) tracking error update (tighten obstacle radius)
-        if planned_next_xy is not None:
-            curr_err = float(np.linalg.norm(robot_xy - planned_next_xy))
-            if curr_err > max_tracking_error:
-                max_tracking_error = curr_err
-                ctrl.obstacle_rad = cfg.obstacle_rad + max_tracking_error
-
-        safe_thresh = cfg.robot_rad + cfg.obstacle_rad + max_tracking_error
-
-        # goal check
         dist_to_goal = float(np.linalg.norm(robot_xy - goal))
-        if dist_to_goal < cfg.goal_reach_threshold:
-            status_text.set_text(f"GOAL reached | dist={dist_to_goal:.2f} | infeasible={infeasible_count}")
+        if dist_to_goal <= 0.6:
+            status_text.set_text(
+                f"GOAL reached | timestep={k} | dist={dist_to_goal:.2f} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
+            )
             status_text.set_color("green")
             anim.event_source.stop()
             return []
 
-        # (B) perception & prediction
-        p_t = obst_ep[t]
-        vis = mask_ep[t].astype(bool)
-        pred = make_cv_prediction_from_two_points(obst_ep[t - 1], p_t, cfg.TIME_HORIZON, cfg.box)
-        obst_mask = np.repeat(vis[None], cfg.TIME_HORIZON, axis=0)
+        p_dict = pred_all[ts_key]   # predictions at t: give (t+1..t+H)
+        h_dict = hist_all[ts_key]   # history up to t: last = y_t
+        f_dict = fut_all[ts_key]    # future at t: gives (t+1..t+H) GT
 
-        # (C) visualization grid field (not used by controller)
+        # Current observed positions at time t (used for collision check only)
+        p_now = get_current_obs_from_history(h_dict)
+
+        # Choose which future step to visualize/compare
+        i_view = 0 # 0 means t+1 in reference convention
+
+        # Build pred tensor (H, M, 2): pred[i] corresponds to t+1+i
+        pred, obst_mask, _ = stack_pred_from_p_dict(p_dict, horizon=time_horizon)
+
+        # Predicted points at target time (t+1+i_view)
+        pred_i = pred[i_view]              # (M,2)
+        mask_i = obst_mask[i_view]         # (M,)
+        pred_pts = pred_i[mask_i]          # only valid predicted agents
+
+        # CP lower-bound field at the SAME target time (t+1+i_view)
         lower_field = compute_lower_field_single_step(
-            pred[0],
-            obst_mask[0],
+            pred_i,
+            mask_i,
             Xg,
             Yg,
-            g_upper_grid[0],          # ✅ grid envelope for viz
-            cfg.world_center,
+            g_upper_grid[i_view],
+            world_center,
         )
 
-        y_true_rel = p_t[vis] - cfg.world_center
-        true_dist = distance_field_points(y_true_rel, Xg, Yg) if y_true_rel.size > 0 else np.full((cfg.H, cfg.W), 20.0)
+        safe_thresh = ROBOT_RAD + OBSTACLE_RAD
 
-        im_true.set_data((true_dist < safe_thresh).astype(float))
+        dist_now = distance_field_points(p_now - world_center, Xg, Yg) if p_now.size > 0 else np.full((grid_H, grid_W), np.inf, dtype=np.float32)
+
+        im_true.set_data((dist_now < safe_thresh).astype(float))
         im_cp.set_data((lower_field < safe_thresh).astype(float))
+        im_heat.set_data(lower_field)
 
-        # (D) MPC step (uses cp_params internally; no grid eval)
+        # Control uses full horizon pred (still reference-aligned)
         act, info = ctrl(
             pos_x=float(robot_xy[0]),
             pos_y=float(robot_xy[1]),
             orientation_z=float(robot_th),
-            boxes=None,
+            boxes=[],
             obst_pred_traj=pred,
             obst_mask=obst_mask,
             goal=goal,
         )
-
+        current_w_safety = ctrl.update_adaptive_weight(
+                    pos_x=float(robot_xy[0]), 
+                    pos_y=float(robot_xy[1]), 
+                    tracking_res=h_dict
+                )
         feasible = bool(info.get("feasible", False))
         if not feasible:
-            infeasible_count += 1
+            if k > 15:
+                infeasible_count += 1
             v, w = 0.0, 0.0
         else:
             v, w = float(act[0]), float(act[1])
+        if k <= 15:
+            v, w = 0.0, 0.0
 
-        plan = info.get("final_path")
-        planned_next_xy = plan[1].copy() if (plan is not None and len(plan) > 1) else robot_xy.copy()
+        plan = info.get("final_path", None)
 
-        # (E) physics + collision
-        robot_xy, robot_th = unicycle_step(robot_xy, robot_th, v, w, cfg.mpc_dt)
-        robot_xy = reflect_to_box_xy(robot_xy, cfg.box)
-        robot_traj.append(robot_xy.copy())
+        # Collision check MUST use current observed positions at time t
+        # (not future positions)
 
-        dmin = float(min_dist_robot_to_peds(robot_xy, p_t[vis]))
-        is_coll = dmin < (cfg.robot_rad + cfg.obstacle_rad)
-        if is_coll:
+        if p_now.size == 0:
+            dmin = np.inf
+        else:
+            dmin = float(min_dist_robot_to_peds(robot_xy, p_now))
+        is_coll = dmin < safe_thresh
+        if is_coll and k > 15:
             collision_count += 1
 
-        # (F) render
-        im_heat.set_data(lower_field)
-        curr_traj = np.stack(robot_traj)
+        traj = np.stack(robot_traj)
 
-        for i in range(2):
-            robot_dots[i].set_data([robot_xy[0]], [robot_xy[1]])
-            robot_dots[i].set_color("red" if is_coll else "blue")
-            traj_lines[i].set_data(curr_traj[:, 0], curr_traj[:, 1])
+        for ax_i in range(2):
+            robot_dots[ax_i].set_data([robot_xy[0]], [robot_xy[1]])
+            robot_dots[ax_i].set_color("red" if is_coll else "blue")
+            traj_lines[ax_i].set_data(traj[:, 0], traj[:, 1])
+
             if plan is not None:
-                plan_lines[i].set_data(plan[:, 0], plan[:, 1])
-            peds_scatters[i].set_offsets(p_t[vis] if p_t[vis].size else np.zeros((0, 2)))
+                plan_lines[ax_i].set_data(plan[:, 0], plan[:, 1])
+
+            # For visualization:
+            # - show current observed pedestrians at time t
+            peds_scatters[ax_i].set_offsets(p_now if p_now.size else np.zeros((0, 2), dtype=np.float32))
 
         status_text.set_text(
-            f"Step:{t} | coll:{collision_count} | infeas:{infeasible_count} | "
-            f"track_err_max:{max_tracking_error:.3f} | safe_thr:{safe_thresh:.2f}"
+            f"dataset={dataset} | step={k} | "
+            f"collisions={collision_count} | infeasible={infeasible_count} | "
+            f"dist_goal={float(np.linalg.norm(robot_xy - goal)):.2f}"
         )
         status_text.set_color("red" if (is_coll or not feasible) else "black")
+
+        # Update robot
+        robot_xy, robot_th = unicycle_step(robot_xy, robot_th, v, w, DT)
+        robot_traj.append(robot_xy.copy())
+
+
         return []
 
-    anim = FuncAnimation(fig, update, frames=obst_ep.shape[0] - 1, interval=100, blit=False)
+    anim = FuncAnimation(fig, update, frames=max_n_steps, interval=100, blit=False, repeat=False)
     plt.show()
 
 
-# ==============================================================================
-# entry
-# ==============================================================================
-
 if __name__ == "__main__":
-    cfg = SimConfig(base_dir=os.path.dirname(os.path.abspath(__file__)))
-    run_one_episode_visual(cfg)
+    DATASET = "eth"
+    run_one_episode_visual_from_file(
+        dataset=DATASET,
+        scenario_idx=0,
+        time_horizon=17,
+        grid_H=128,
+        grid_W=128,
+        alpha=0.05,
+        p_base=4,
+        k_mix=5,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=max(1, (os.cpu_count() or 4) - 2),
+        backend="loky",
+        n_skip=4,
+        n_paths=3000,
+        max_tracking_error=0.05,
+    )

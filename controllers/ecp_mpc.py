@@ -1,6 +1,6 @@
 from typing import Dict
 import numpy as np
-from utils import compute_pairwise_distances_along_axis, compute_pairwise_distances, compute_quantiles
+from controllers.utils import compute_pairwise_distances_along_axis, compute_pairwise_distances, compute_quantiles
 
 DISTANCE_BOUND = 10000
 

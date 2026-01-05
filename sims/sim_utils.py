@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 # Local module imports
-from func_cp.utils import build_grid, reflect_vectorized, distance_field_points
+from utils import build_grid, reflect_vectorized, distance_field_points
 
 
 def reflect_to_box_xy(xy: np.ndarray, box: float) -> np.ndarray:
@@ -45,6 +45,29 @@ def build_cv_predictions(trajs_true, box, horizon):
             curr = reflect_vectorized(curr + v, box)
         trajs_pred[:, t] = curr
     return trajs_pred
+
+def build_cv_predictions_leadtime(trajs_true: np.ndarray, box: float, horizon: int) -> np.ndarray:
+    """
+    Returns:
+        pred: (N, T, time_horizon, M, 2)
+        pred[n, t, i-1, m] = y_hat_{t+i|t} for agent m
+    """
+    if trajs_true.ndim == 3:
+        trajs_true = trajs_true[:, :, None, :]  # (N,T,1,2)
+
+    N, T, M, _ = trajs_true.shape
+    pred = np.zeros((N, T, horizon, M, 2), dtype=np.float32)
+
+    for t in range(1, T):  # need t-1
+        y_tm1 = trajs_true[:, t-1]  # (N,M,2)
+        y_t   = trajs_true[:, t]    # (N,M,2)
+        v = (y_t - y_tm1).astype(np.float32)
+        curr = y_t.copy().astype(np.float32)
+        for i in range(horizon):
+            curr = reflect_vectorized(curr + v, box)
+            pred[:, t, i] = curr
+
+    return pred
 
 def make_cv_prediction_from_two_points(y_tm1, y_t, n_steps, box):
     v = (y_t - y_tm1).astype(np.float32)

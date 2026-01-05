@@ -555,9 +555,34 @@ def render_cp_comparison_paper_multi(
         xs = np.linspace(0.0, box, Ww)
         ys = np.linspace(0.0, box, Hh)
         X, Y = np.meshgrid(xs, ys)
-        for ax, F in [(ax0, F_true), (ax1, F_cp)]:
-            ax.contour(X, Y, F, levels=[safe_threshold], linestyles="--", linewidths=1.2)
 
+        # Left: true SDF threshold
+        ax0.contour(
+            X, Y, F_true,
+            levels=[safe_threshold],
+            colors="white",
+            linestyles="--",
+            linewidths=1.4,
+        )
+
+        # Right: true SDF threshold (reference)
+        ax1.contour(
+            X, Y, F_true,
+            levels=[safe_threshold],
+            colors="white",
+            linestyles="--",
+            linewidths=1.2,
+            alpha=0.8,
+        )
+
+        # Right: conformal lower-bound threshold
+        ax1.contour(
+            X, Y, F_cp,
+            levels=[safe_threshold],
+            colors="red",
+            linestyles="--",
+            linewidths=1.6,
+        )
     # -----------------------------
     # Optional: markers (robot + obstacles)
     # -----------------------------
@@ -567,9 +592,6 @@ def render_cp_comparison_paper_multi(
         for ax in (ax0, ax1):
             ax.plot(robot_xy[0], robot_xy[1], "o", ms=3.5)
             ax.plot(obst_xy[:, 0], obst_xy[:, 1], "x", ms=4.0, mew=1.2)
-
-            ax.contour(X, Y, F, levels=[safe_threshold],
-                    linestyles="--", linewidths=1.0)
 
     # -----------------------------
     # Formatting

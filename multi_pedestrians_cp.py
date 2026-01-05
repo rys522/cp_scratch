@@ -11,7 +11,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATASET = "zara1"
 
-H, W = 64, 64
+H, W = 128, 128
 BOX = 100.0
 SCALING = None
 
@@ -20,15 +20,15 @@ WORLD_CENTER = np.array([BOX / 2.0, BOX / 2.0], dtype=np.float32)
 EGO_BOX = 60.0
 
 TSTEPS = 12
-N_TRAIN = 1000
+N_TRAIN = 10000
 SEED = 2023
-TIME_HORIZON = 1
+TIME_HORIZON = 2
 EVAL_SEEDS = np.arange(SEED + 100, SEED + 110)
 
 SAFE_THRESHOLD = 4
 
 P_BASE = 3
-K_MIX = 5
+K_MIX = 4
 ALPHA = 0.05
 TEST_SIZE = 0.30
 RANDOM_STATE = 0

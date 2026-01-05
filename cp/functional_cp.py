@@ -30,7 +30,7 @@ class CPConfig:
     """
     p_base: int = 3
     K: int = 4
-    alpha_total: float = 0.01
+    alpha_total: float = 0.05
     test_size: float = 0.30
     random_state: int = 0
     n_jobs: int = 1
@@ -39,28 +39,54 @@ class CPConfig:
     # numerical stability
     cov_jitter: float = 1e-8
 
-    # coverage bookkeeping
-    split_alpha: bool = True  # if False: use alpha_total for both eps and gmm (less clean)
-
 
 @dataclass
 class CPStepParameters:
     """
-    Offline data for (24)-style param upper envelope U_i(x).
+    Offline parameter set Θ_i for the parametric functional upper envelope U_i(x)
+    (cf. Eq. (24) and the paragraph "Offline parameterization" in the paper).
 
-    mean_field, phi_basis: PCA reconstruction parameters
-    epsilon: reconstruction slack (L_infty)
-    mus, sigmas: GMM params in PCA score space (K,p)
-    rks: refined ellipsoid radii (K,)
+    We cache the full offline parameter set
+        Θ_i = ( φ_i, ε_i, { μ_{k,i}, Σ_{k,i}, r_{k,i} }_{k=1}^K ),
+
+    where:
+    - φ_i        : projection basis (defining the operator Π_{p_i}),
+                   represented in discretized form by `phi_basis`
+                   (e.g., PCA components learned from residuals at step i);
+    - ε_i        : projection/reconstruction slack satisfying
+                   || S_{t+i|t} − Π_{p_i} S_{t+i|t} ||_∞ ≤ ε_i;
+    - μ_{k,i}    : mean vector of the k-th Gaussian component in coefficient space;
+    - Σ_{k,i}    : covariance matrix of the k-th Gaussian component in coefficient space;
+    - r_{k,i}    : calibrated ellipsoidal radius associated with the k-th component.
+
+    These parameters jointly define the conformal upper envelope
+        U_i(x) = ε_i + max_k { μ_{k,i}^T φ_i(x)
+                               + r_{k,i} ( φ_i(x)^T Σ_{k,i} φ_i(x) )^{1/2} }.
     """
+
+    # horizon index i (time-to-go)
     t_idx: int
-    mean_field: np.ndarray
+
+    # discretized projection basis φ_i:
+    # shape (p_i, D), where each row corresponds to a basis function φ_{i,j}
     phi_basis: np.ndarray
+
+    # projection slack ε_i (L_infty reconstruction error bound)
     epsilon: float
+
+    # GMM means μ_{k,i} in coefficient space, shape (K, p_i)
     mus: np.ndarray
+
+    # GMM covariances Σ_{k,i} in coefficient space, shape (K, p_i, p_i)
     sigmas: np.ndarray
+
+    # refined ellipsoidal radii r_{k,i} for each mixture component, shape (K,)
     rks: np.ndarray
+
+    # number of Gaussian mixture components K
     K: int
+
+    # effective projection dimension p_i
     p_eff: int
 
 
@@ -209,7 +235,6 @@ def _delta_ks_LRW(
     if val_at_mu_s <= other_at_mu_s:
         return float(val_at_mu_s)
 
-    # eta(c) caching (optional)
     def eta(c: float) -> float:
         if eta_cache is None or cache_key is None:
             return _eta_of_c_QCQP(c, mu_k, Sigma_k, mu_s, Sigma_s)
@@ -311,19 +336,13 @@ class PCAGMMResidualCP:
         N, Yw, H, W, D = self._get_flat_view(t_idx)
         p_eff = int(min(self.cfg.p_base, N, D))
 
-        # alpha split for cleaner coverage bookkeeping
-        if self.cfg.split_alpha:
-            alpha_eps = 0.5 * self.cfg.alpha_total
-            alpha_gmm = 0.5 * self.cfg.alpha_total
-        else:
-            alpha_eps = self.cfg.alpha_total
-            alpha_gmm = self.cfg.alpha_total
+        alpha_eps = self.cfg.alpha_total
+        alpha_gmm = self.cfg.alpha_total
 
         # 1) PCA projection
         pca = PCA(n_components=p_eff, svd_solver="randomized", random_state=self.cfg.random_state)
         scores = pca.fit_transform(Yw)             # (N, p_eff)
         phi_basis = pca.components_                # (p_eff, D)
-        mean_field = pca.mean_                     # (D,)
 
         # 2) reconstruction slack epsilon (L_infty across coordinates)
         Y_recon = pca.inverse_transform(scores)
@@ -373,7 +392,6 @@ class PCAGMMResidualCP:
 
         return CPStepParameters(
             t_idx=t_idx,
-            mean_field=mean_field.astype(np.float32),
             phi_basis=phi_basis.astype(np.float32),
             epsilon=float(epsilon),
             mus=gmm.means_.astype(np.float32),
@@ -404,7 +422,7 @@ class PCAGMMResidualCP:
             rad = p.rks[k] * np.sqrt(np.clip(quad_diag, 0.0, None))
             upper_bounds[k] = center + rad
 
-        g_upper_vec = p.mean_field + np.max(upper_bounds, axis=0) + p.epsilon
+        g_upper_vec = np.max(upper_bounds, axis=0) + p.epsilon
 
         H, W, _ = self._extract_shapes()
         return self._unflatten(g_upper_vec.astype(np.float32), H, W)
@@ -463,6 +481,34 @@ class PCAGMMResidualCP:
         if self._residuals is None or self._N is None or self._T_res is None:
             raise RuntimeError("PCAGMMResidualCP is not fitted. Call fit(residuals) first.")
 
+    def precompute_all_from_params(self, params_list: List[CPStepParameters]) -> np.ndarray:
+        """
+        params_list: length T_res, each has ( phi_basis, mus, sigmas, rks, epsilon, ...)
+        returns: (T_res, H, W) or (T_res, D)
+        """
+        self._assert_fitted()
+        H, W, _ = self._extract_shapes()
+
+        def one(p: CPStepParameters) -> np.ndarray:
+            D = int(p.phi_basis.shape[1])
+            AT = p.phi_basis.T  # (D, p_eff)
+
+            upper_bounds = np.zeros((p.K, D), dtype=np.float32)
+            for k in range(p.K):
+                center = AT @ p.mus[k]          # (D,)
+                AS = AT @ p.sigmas[k]           # (D,p)
+                quad_diag = np.einsum("dp,dp->d", AS, AT)
+                rad = float(p.rks[k]) * np.sqrt(np.clip(quad_diag, 0.0, None))
+                upper_bounds[k] = center + rad
+
+            g_upper_vec = np.max(upper_bounds, axis=0) + float(p.epsilon)
+            return g_upper_vec.reshape(H, W) if (H is not None and W is not None) else g_upper_vec
+
+        results = Parallel(n_jobs=self.cfg.n_jobs, backend=self.cfg.backend)(
+            delayed(one)(p) for p in params_list
+        )
+        return np.asarray(results, dtype=np.float32)
+
 
 # ==============================================================================
 # 3) Functional interface
@@ -478,7 +524,6 @@ def compute_cp_upper_envelopes(
     n_jobs: int,
     backend: str,
     *,
-    split_alpha: bool = True,
     cov_jitter: float = 1e-8,
 ) -> np.ndarray:
     """
@@ -493,13 +538,15 @@ def compute_cp_upper_envelopes(
         random_state=random_state,
         n_jobs=n_jobs,
         backend=backend,
-        split_alpha=split_alpha,
         cov_jitter=cov_jitter,
     )
     model = PCAGMMResidualCP(cfg)
     model.fit(residuals_train)
-    return model.precompute_all()
 
+    params = model.get_online_parameters_all()
+
+    g_upper = model.precompute_all_from_params(params)
+    return g_upper
 
 def get_envelopes_function(
     residuals_train: np.ndarray,
@@ -511,12 +558,11 @@ def get_envelopes_function(
     n_jobs: int,
     backend: str,
     *,
-    split_alpha: bool = True,
     cov_jitter: float = 1e-8,
-) -> List[CPStepParameters]:
+) -> List[CPStepParameters] :
     """
     residuals_train: (N,T,H,W) or (N,T,D)
-    returns: List[CPStepParameters]  (t_idx별 파라미터)
+    returns: (T,H,W) or (T,D), List[CPStepParameters]  (t_idx별 파라미터)
     """
     cfg = CPConfig(
         p_base=p_base,
@@ -526,9 +572,39 @@ def get_envelopes_function(
         random_state=random_state,
         n_jobs=n_jobs,
         backend=backend,
-        split_alpha=split_alpha,
         cov_jitter=cov_jitter,
     )
     model = PCAGMMResidualCP(cfg)
     model.fit(residuals_train)
     return model.get_online_parameters_all()
+
+def get_envelopes_value_and_function(
+    residuals_train: np.ndarray,
+    p_base: int,
+    K: int,
+    alpha: float,
+    test_size: float,
+    random_state: int,
+    n_jobs: int,
+    backend: str,
+    *,
+    cov_jitter: float = 1e-8,
+) -> Tuple[np.ndarray, List[CPStepParameters]]:
+    cfg = CPConfig(
+        p_base=p_base,
+        K=K,
+        alpha_total=alpha,
+        test_size=test_size,
+        random_state=random_state,
+        n_jobs=n_jobs,
+        backend=backend,
+        cov_jitter=cov_jitter,
+    )
+    model = PCAGMMResidualCP(cfg)
+    model.fit(residuals_train)
+
+    params = model.get_online_parameters_all()
+
+    g_upper = model.precompute_all_from_params(params)
+
+    return g_upper, params

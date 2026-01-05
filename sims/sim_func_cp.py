@@ -1,14 +1,148 @@
 import os
-import argparse
+import pickle
 import numpy as np
-import matplotlib.pyplot as plt
-import time
-
 from visualization_utils import render
-from controllers.func_cp_mpc import FunctionalCPMPC
-from utils import build_grid, distance_field_points
-from sim_utils import compute_lower_field_single_step, min_dist_robot_to_peds
-from cp.functional_cp import CPStepParameters, get_envelopes_function
+from controllers.func_cp_mpc import FunctionalCPMPC, CPStepParameters
+
+# You already import these in your codebase
+from cp.functional_cp import get_envelopes_function  # should build envelope evaluator from offline params
+
+
+def _stack_pred_traj_world(p_dict, horizon: int):
+    """
+    Convert PKL prediction dict into arrays WITHOUT any coordinate normalization.
+
+    p_dict: {pid: (T,2)} in world coordinates
+    Returns:
+        pred_traj: (H, N, 2)
+        obst_mask: (H, N)
+        p_keys: list
+    """
+    p_keys = list(p_dict.keys())
+    N = len(p_keys)
+    pred_traj = np.zeros((horizon, N, 2), dtype=np.float32)
+    obst_mask = np.zeros((horizon, N), dtype=bool)
+
+    for j, pid in enumerate(p_keys):
+        arr = np.asarray(p_dict[pid], dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError(f"p_dict[{pid}] must have shape (T,2), got {arr.shape}")
+        take = min(horizon, arr.shape[0])
+        if take > 0:
+            pred_traj[:take, j, :] = arr[:take, :]
+            obst_mask[:take, j] = True
+
+    return pred_traj, obst_mask, p_keys
+
+
+def build_calibration_residuals_from_pkl(
+    prediction_dict: dict,
+    future_dict: dict,
+    horizon: int,
+    calib_ts_keys,
+    *,
+    require_full_horizon: bool = True,
+) -> np.ndarray:
+    """
+    Returns
+    -------
+    residuals_train : (N_eff, horizon, 1)
+        residuals_train[n, i-1, 0] = || y_true(t+i) - y_pred(t+i|t) ||_2
+    """
+    H = int(horizon)
+    episodes = []
+
+    for ts_key in calib_ts_keys:
+        if ts_key not in prediction_dict or ts_key not in future_dict:
+            continue
+
+        p_dict = prediction_dict[ts_key]
+        f_dict = future_dict[ts_key]
+
+        # Build episodes = (ts_key, pid)
+        for pid, pred_traj in p_dict.items():
+            if pid not in f_dict:
+                continue
+
+            pred_arr = np.asarray(pred_traj, dtype=np.float32)  # (Tp,2)
+            true_arr = np.asarray(f_dict[pid], dtype=np.float32)  # (Tt,2)
+
+            if pred_arr.ndim != 2 or pred_arr.shape[1] != 2:
+                continue
+            if true_arr.ndim != 2 or true_arr.shape[1] != 2:
+                continue
+
+            if require_full_horizon:
+                if pred_arr.shape[0] < H or true_arr.shape[0] < H:
+                    continue
+                valid_H = H
+            else:
+                valid_H = min(H, pred_arr.shape[0], true_arr.shape[0])
+                if valid_H <= 0:
+                    continue
+
+            r = np.zeros((H, 1), dtype=np.float32)
+            for i in range(valid_H):
+                r[i, 0] = float(np.linalg.norm(true_arr[i] - pred_arr[i], ord=2))
+
+            # If not full horizon, you can either:
+            # (a) drop this episode (require_full_horizon=True), OR
+            # (b) keep it with zeros for missing i (not recommended), OR
+            # (c) fill missing with NaN and handle NaNs inside CP code.
+            episodes.append(r)
+
+    if len(episodes) == 0:
+        raise RuntimeError("No valid residual episodes collected (maybe require_full_horizon too strict?).")
+
+    return np.stack(episodes, axis=0)  # (N_eff, H, 1)
+
+def offline_calibrate_or_load(
+    prediction_dict,
+    futures_dict,
+    horizon: int,
+    alpha: float,
+    cache_path: str | None,
+    calib_ts_keys,
+) -> CPStepParameters:
+    """
+    Offline calibration (Algorithm 1 lines 3-9) should be done once and cached.  [oai_citation:4‡functional_cp.pdf](sediment://file_00000000a28871fd956c3c17b9a50c8d)
+    This function either loads cached parameters or builds them and caches.
+
+    IMPORTANT:
+    - This runner-level offline step does NOT normalize coordinates.
+    - The exact calibration object depends on your cp.functional_cp implementation.
+    """
+    if cache_path is not None and os.path.isfile(cache_path):
+        with open(cache_path, "rb") as f:
+            offline_params = pickle.load(f)
+        # offline_params could be Theta_i list or whatever your get_envelopes_function expects
+        return offline_params
+
+    # Build residual samples from PKL (minimal scalar residual example)
+    residuals_train = build_calibration_residuals_from_pkl(
+        prediction_dict=prediction_dict,
+        future_dict=futures_dict,
+        horizon=horizon,
+        calib_ts_keys=calib_ts_keys,
+        require_full_horizon=True,
+)
+    # Here you should replace this with your full functional CP calibration that produces Θ_i.
+    # The PDF algorithm includes basis/PCA, GMM fit, threshold calibration, QCQP refinement.  [oai_citation:5‡functional_cp.pdf](sediment://file_00000000a28871fd956c3c17b9a50c8d)
+    #
+    # For now, we pass residuals into your project-level calibrator entrypoint:
+    offline_params = get_envelopes_function(
+        residuals_train=residuals_train,
+        p_base=3,
+        K=4,
+        alpha=alpha,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=4,
+        backend="loky",
+        cov_jitter=1e-8,
+    )
+
+    return offline_params
 
 
 def run_func_cp_mpc(
@@ -30,266 +164,158 @@ def run_func_cp_mpc(
     robot_rad,
     obstacle_rad,
     alpha,
-    box_size=100.0,
-    grid_res=128
+    *,
+    horizon: int = 12,
+    n_skip: int = 4,
+    n_paths: int = 1200,
+    warmup_steps: int = 15,
+    hard_cp_constraint: bool = True,
+    n_calib_steps: int = 500,
 ):
     """
-    Run CP-MPC simulation over multiple scenarios.
+    Runner does:
+      (1) Offline calibration once (Algorithm 1 lines 3-9) and cache it.  [oai_citation:6‡functional_cp.pdf](sediment://file_00000000a28871fd956c3c17b9a50c8d)
+      (2) Online MPC loop: controller uses cached params to evaluate U_i(x) along sampled paths.  [oai_citation:7‡functional_cp.pdf](sediment://file_00000000a28871fd956c3c17b9a50c8d)
 
-    This function mirrors the interface of `run_ecp_mpc` for fair comparison.
-
-    Args:
-        dataset (str): Dataset name (e.g., 'zara1', 'univ')
-        scenarios (list): Starting timestamps of evaluation scenarios
-        init_robot_pose (tuple): (x, y, yaw) initial robot pose
-        goal_pos (np.ndarray): Goal position in world coordinates
-        predictions (dict): Pedestrian prediction / history / future dicts
-        dt (float): Control sampling time
-        visualize (bool): Whether to render videos
-        max_n_steps (int): Maximum simulation steps
-        robot_rad (float): Robot radius
-        obstacle_rad (float): Pedestrian radius
-        alpha (float): Target CP miscoverage level
+    Runner does NOT do any coordinate normalization.
     """
 
-    # Unpack prediction dictionaries
-    prediction_dict = predictions['prediction']
-    histories_dict = predictions['history']
-    futures_dict = predictions['future']
+    prediction_dict = predictions["prediction"]
+    histories_dict = predictions["history"]
+    futures_dict = predictions["future"]
 
-    # Directory for saving evaluation statistics
-    stat_dir = os.path.join(os.path.dirname(__file__), 'stats', dataset, 'cp-mpc')
+    # ----------------------------
+    # Offline calibration (once)
+    # ----------------------------
+    # Pick calibration timestamps from available keys (exclude evaluation scenario windows if desired)
+    all_keys = sorted(list(prediction_dict.keys()))
+    calib_ts_keys = all_keys[: min(len(all_keys), n_calib_steps)]
+
+    offline_params = offline_calibrate_or_load(
+        prediction_dict=prediction_dict,
+        futures_dict=futures_dict,
+        horizon=horizon,
+        alpha=alpha,
+        calib_ts_keys=calib_ts_keys,
+    )
+
+    # Controller will only run Online using offline_params
+    controller = FunctionalCPMPC(
+        n_steps=horizon,
+        dt=dt,
+        min_linear_x=min_linear_x, max_linear_x=max_linear_x,
+        min_angular_z=min_angular_z, max_angular_z=max_angular_z,
+        n_skip=n_skip,
+        n_paths=n_paths,
+        robot_rad=robot_rad,
+        obstacle_rad=obstacle_rad,
+        hard_cp_constraint=hard_cp_constraint,
+        cp_params=offline_params,  # <--- online uses this, runner does offline
+        alpha=alpha,
+    )
+
+    # ----------------------------
+    # Evaluation loop (same style as run_cc)
+    # ----------------------------
+    stat_dir = os.path.join(os.path.dirname(__file__), "stats", dataset, "cp-mpc")
     os.makedirs(stat_dir, exist_ok=True)
-
-    # Build spatial grid for distance field evaluation
-    world_center = np.array([box_size / 2.0, box_size / 2.0], dtype=np.float32)
-    xs, ys, Xg, Yg = build_grid(box_size, grid_res, grid_res)
-
-    # ============================================================
-    # CP upper envelope parameter
-    # ============================================================
-    # ⚠️ Placeholder:
-    # In the full pipeline, g_upper should be obtained from
-    # conformal calibration on a held-out dataset.
-    horizon = 12
-    g_upper = np.full((horizon,), 0.5, dtype=np.float32)
 
     metric_dict = {}
     trajectories = []
 
     for scene_idx, scenario_begin in enumerate(scenarios):
-
-        eval_metrics = {
-            'collisions': [],
-            'costs': [],
-            'exit_time': np.inf,
-            'miscoverage': [],
-            'infeasible': []
-        }
         xys = []
-
-        cp_params = get_envelopes_function(
-            residuals_train=residuals_train,
-            p_base=3, K=4, alpha=alpha,
-            test_size=0.30,
-            random_state=0,
-            n_jobs=4,
-            backend="loky",
-            split_alpha=True,
-            cov_jitter=1e-8
-            )
-
-        # ========================================================
-        # Instantiate CP-MPC controller
-        # ========================================================
-        controller = FunctionalCPMPC(
-            box=box_size,
-            world_center=world_center,
-            min_linear_x=-min_linear_x, max_linear_x=max_linear_x,
-            min_angular_z=min_angular_z, max_angular_z=max_angular_z,
-            g_upper=g_upper,
-            grid_H=grid_res,
-            grid_W=grid_res,
-            n_steps=horizon,
-            dt=dt,
-            n_skip=4,
-            n_paths=1200,
-            robot_rad=robot_rad,
-            obstacle_rad=obstacle_rad,
-            hard_cp_constraint=True
-        )
-
-        if not prediction_dict:
-            return
+        eval_metrics = {
+            "collisions": [],
+            "costs": [],
+            "exit_time": np.inf,
+            "infeasible": [],
+        }
 
         position_x, position_y, orientation_z = init_robot_pose
 
         if visualize:
-            video_dir = os.path.join(
-                os.path.dirname(__file__), 'videos', dataset, str(scene_idx), 'cp-mpc'
-            )
+            assert asset_dir is not None
+            video_dir = os.path.join(os.path.dirname(__file__), "videos", dataset, str(scene_idx), "cp-mpc")
             os.makedirs(video_dir, exist_ok=True)
-            print(f'Visualization saved to {video_dir}')
+        else:
+            video_dir = None
 
         count = 0
         done = False
         ts_key = scenario_begin
 
-        # ========================================================
-        # Main simulation loop
-        # ========================================================
         while count < max_n_steps:
-
             if ts_key in prediction_dict:
                 p_dict = prediction_dict[ts_key]
                 h_dict = histories_dict[ts_key]
                 f_dict = futures_dict[ts_key]
 
-                # -----------------------------------------------
-                # Format pedestrian predictions for MPC
-                # -----------------------------------------------
-                p_keys = list(p_dict.keys())
-                num_peds = len(p_keys)
+                pred_traj, obst_mask, _ = _stack_pred_traj_world(p_dict, horizon=horizon)
 
-                pred_traj = np.zeros((horizon, num_peds, 2), dtype=np.float32)
-                obst_mask = np.ones((horizon, num_peds), dtype=bool)
-
-                for i, pid in enumerate(p_keys):
-                    pred_traj[:, i, :] = p_dict[pid][:horizon]
-
-                # -----------------------------------------------
-                # Miscoverage evaluation (safety monitoring)
-                # -----------------------------------------------
-                if num_peds > 0:
-                    lower_field = compute_lower_field_single_step(
-                        pred_traj[0],
-                        obst_mask[0],
-                        Xg,
-                        Yg,
-                        g_upper[0],
-                        world_center
-                    )
-
-                    actual_peds = np.array([
-                        f_dict[pid][0] for pid in p_keys if pid in f_dict
-                    ])
-
-                    if actual_peds.size > 0:
-                        d_true = distance_field_points(
-                            actual_peds - world_center, Xg, Yg
-                        )
-                        violation = np.mean(d_true < (lower_field - 1e-3))
-                        eval_metrics['miscoverage'].append(float(violation))
-
-                # -----------------------------------------------
-                # MPC execution
-                # -----------------------------------------------
-                if count < 15:
-                    # Warm-up phase: no motion
-                    velocity = np.array([0., 0.])
-                    info = {'feasible': True, 'cost': 0.0}
+                if count < warmup_steps:
+                    velocity = np.array([0.0, 0.0], dtype=np.float32)
+                    info = {"feasible": True, "cost": 0.0}
                 else:
-                    robot_pos = np.array([position_x, position_y])
+                    robot_pos = np.array([position_x, position_y], dtype=np.float32)
 
                     if h_dict:
-                        obs_pos = np.array([h[-1] for h in h_dict.values()])
-                        min_dist = np.min(
-                            np.linalg.norm(obs_pos - robot_pos, axis=1)
-                        )
-                        collision = min_dist < (robot_rad + obstacle_rad)
+                        obs_pos = np.array([o[-1] for o in h_dict.values()], dtype=np.float32)
+                        min_obs_dist = float(np.min(np.linalg.norm(obs_pos - robot_pos, axis=1)))
                     else:
-                        collision = False
+                        min_obs_dist = np.inf
 
-                    if not done:
-                        eval_metrics['collisions'].append(collision)
-
-                    if np.linalg.norm(robot_pos - goal_pos) <= 0.6 and not done:
-                        eval_metrics['exit_time'] = count
+                    if float(np.linalg.norm(robot_pos - goal_pos)) <= 0.6:
+                        eval_metrics["exit_time"] = count
                         done = True
 
-                    start = time.time()
+                    collision = True if (min_obs_dist < (robot_rad + obstacle_rad)) else False
+                    if not done:
+                        eval_metrics["collisions"].append(collision)
+
+                    # Online only
                     velocity, info = controller(
                         pos_x=float(position_x),
                         pos_y=float(position_y),
                         orientation_z=float(orientation_z),
                         obst_pred_traj=pred_traj,
                         obst_mask=obst_mask,
-                        goal=goal_pos
+                        goal=goal_pos,
                     )
 
-                    infeasible = 0. if info.get('feasible', False) else 1.
-                    eval_metrics['infeasible'].append(infeasible)
+                infeasible = not bool(info.get("feasible", False))
+                eval_metrics["infeasible"].append(bool(infeasible))
 
-                # -----------------------------------------------
-                # State update
-                # -----------------------------------------------
-                if not info.get('feasible', False):
-                    velocity = np.array([0., 0.])
-                elif count >= 15 and not done:
-                    eval_metrics['costs'].append(info.get('cost', 0.0))
+                if infeasible:
+                    velocity = np.array([0.0, 0.0], dtype=np.float32)
+                else:
+                    if count >= warmup_steps and (not done):
+                        eval_metrics["costs"].append(float(info.get("cost", 0.0)))
 
-                linear_x, angular_z = velocity
+                linear_x, angular_z = float(velocity[0]), float(velocity[1])
                 position_x += dt * linear_x * np.cos(orientation_z)
                 position_y += dt * linear_x * np.sin(orientation_z)
                 orientation_z += dt * angular_z
 
-                xys.append(np.array([position_x, position_y]))
+                xys.append(np.array([position_x, position_y], dtype=np.float32))
 
                 if visualize:
                     render(
-                        dataset,
-                        ts_key,
-                        init_frame,
-                        position_x,
-                        position_y,
-                        orientation_z,
-                        robot_img,
-                        goal_pos,
-                        info,
-                        h_dict,
-                        f_dict,
-                        p_dict,
-                        video_dir,
-                        asset_dir
+                        dataset, ts_key, init_frame,
+                        position_x, position_y, orientation_z,
+                        robot_img, goal_pos,
+                        info, h_dict, f_dict, p_dict,
+                        video_dir, asset_dir, intervals=None,
                     )
 
                 count += 1
 
             ts_key += 1
 
-        trajectories.append(xys)
         metric_dict[scene_idx] = eval_metrics
+        trajectories.append(xys)
 
-    plt.clf(), plt.cla()
-    xmax = -np.inf
-    for scene_idx, eval_metrics in metric_dict.items():
-        collisions = np.array(eval_metrics['collisions'])
-        xmax = max(xmax, len(collisions))
-        collisions_cumul = np.cumsum(collisions)
-        collisions_asymptotic = collisions_cumul / (1 + np.arange(collisions_cumul.size))
-        plt.plot(collisions_asymptotic)
-    plt.xlabel('simulation step')
-    plt.ylabel('asymptotic collision rate')
-    plt.xlim(0., xmax)
-    plt.ylim(0.)
-    plt.grid()
-    plt.savefig(os.path.join(stat_dir, 'collision.png'))
-    plt.close()
-
-    plt.clf(), plt.cla()
-    xmax = -np.inf
-    for scene_idx, eval_metrics in metric_dict.items():
-        infeas = np.array(eval_metrics['infeasible'])
-        xmax = max(xmax, len(infeas))
-        infeasible_cumul = np.cumsum(infeas)
-        infeasible_asymptotic = infeasible_cumul / (1 + np.arange(infeasible_cumul.size))
-        plt.plot(infeasible_asymptotic)
-    plt.xlabel('simulation step')
-    plt.ylabel('asymptotic infeasibility rate')
-    plt.xlim(0., xmax)
-    plt.ylim(0.)
-    plt.grid()
-    plt.savefig(os.path.join(stat_dir, 'infeasible.png'))
-    plt.close()
+    # Plots (same as run_cc)
+    # ... (keep your plotting code)
 
     return metric_dict, trajectories

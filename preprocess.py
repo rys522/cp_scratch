@@ -1,6 +1,8 @@
 import os
 import numpy as np
 import pickle
+import matplotlib.pyplot as plt
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -234,21 +236,15 @@ def load_and_print_pickle(file_path):
     except Exception as e:
         print(f"An error occurred while loading the pickle file: {e}")
 
-import os
-import pickle
-import numpy as np
-
-
 def load_eth_pickle_preprocessed(
     dataset: str,
-    box: float,
     T: int,
     split_ratio: float = 0.8,
-    scaling=None,
     seed: int = 0,
     base_dir: str | None = None,
     num_peds: int | None = None,
 ):
+
     if base_dir is None:
         base_dir = os.path.dirname(__file__)
 
@@ -263,81 +259,60 @@ def load_eth_pickle_preprocessed(
     scene_true = {}
     scene_pred = {}
 
+    # 1. 시퀀스 데이터 추출 및 길이 정렬
     for sid in fut_dict.keys():
-        if sid not in pred_dict:
+        if sid not in pred_dict: 
             continue
         common_keys = set(fut_dict[sid].keys()) & set(pred_dict[sid].keys())
-        if len(common_keys) == 0:
+        if len(common_keys) == 0: 
             continue
+        
         for k in common_keys:
             fut  = np.asarray(fut_dict[sid][k], dtype=np.float32)
             pred = np.asarray(pred_dict[sid][k], dtype=np.float32)
-            if fut.ndim != 2 or pred.ndim != 2 or fut.shape[1] != 2 or pred.shape[1] != 2:
+            
+            if fut.ndim != 2 or pred.ndim != 2: 
                 continue
-            if fut.shape[0] < 2:
+            if fut.shape[0] < 2: 
                 continue
-            L_fut  = fut.shape[0]
-            L_pred = pred.shape[0]
+            
+            # 길이 맞추기 (Padding/Truncate)
+            L_fut, L_pred = fut.shape[0], pred.shape[0]
             if L_fut < L_pred:
                 pad = np.repeat(fut[-1][None, :], L_pred - L_fut, axis=0)
-                fut_aligned  = np.concatenate([fut, pad], axis=0)
-                pred_aligned = pred
+                fut_aligned, pred_aligned = np.concatenate([fut, pad], axis=0), pred
             elif L_fut > L_pred:
-                fut_aligned  = fut[:L_pred]
-                pred_aligned = pred
+                fut_aligned, pred_aligned = fut[:L_pred], pred
             else:
-                fut_aligned  = fut
-                pred_aligned = pred
+                fut_aligned, pred_aligned = fut, pred
+                
             scene_true.setdefault(sid, []).append(fut_aligned)
             scene_pred.setdefault(sid, []).append(pred_aligned)
 
     if len(scene_true) == 0:
-        raise ValueError(f"No valid (future, prediction) pairs found in {pkl_path}")
-
-    all_true_list = []
-    all_pred_list = []
-    scene_counts = []
+        raise ValueError(f"No valid data in {pkl_path}")
 
     scene_ids = sorted(scene_true.keys())
-    for sid in scene_ids:
-        eps_true_list = scene_true[sid]
-        eps_pred_list = scene_pred[sid]
-        scene_counts.append(len(eps_true_list))
-        for ep_t, ep_p in zip(eps_true_list, eps_pred_list):
-            all_true_list.append(ep_t)
-            all_pred_list.append(ep_p)
-
-    all_true_list = normalize_world(all_true_list, box, scaling)
-    all_pred_list = normalize_world(all_pred_list, box, scaling)
-
-    idx = 0
-    scene_true_norm = {}
-    scene_pred_norm = {}
-    for sid, n_agents in zip(scene_ids, scene_counts):
-        scene_true_norm[sid] = []
-        scene_pred_norm[sid] = []
-        for _ in range(n_agents):
-            scene_true_norm[sid].append(np.asarray(all_true_list[idx], dtype=np.float32))
-            scene_pred_norm[sid].append(np.asarray(all_pred_list[idx], dtype=np.float32))
-            idx += 1
-
     rng = np.random.default_rng(seed)
 
+    # 2. 최대 에이전트 수 결정
     if num_peds is None:
-        max_agents = max(len(scene_true_norm[sid]) for sid in scene_ids)
+        max_agents = max(len(scene_true[sid]) for sid in scene_ids)
     else:
         max_agents = num_peds
 
     N_scene = len(scene_ids)
+    # 정규화 과정 없이 바로 numpy array에 할당
     true_fixed = np.zeros((N_scene, max_agents, T, 2), dtype=np.float32)
     pred_fixed = np.zeros((N_scene, max_agents, T, 2), dtype=np.float32)
     agent_mask = np.zeros((N_scene, max_agents), dtype=bool)
 
     for i, sid in enumerate(scene_ids):
-        eps_true_list = scene_true_norm[sid]
-        eps_pred_list = scene_pred_norm[sid]
+        eps_true_list = scene_true[sid]
+        eps_pred_list = scene_pred[sid]
         n_agents = len(eps_true_list)
 
+        # 에이전트 수 조절
         if num_peds is not None and n_agents > num_peds:
             idx_sel = rng.choice(n_agents, num_peds, replace=False)
             eps_true_list = [eps_true_list[j] for j in idx_sel]
@@ -351,6 +326,7 @@ def load_eth_pickle_preprocessed(
             ep_pred = eps_pred_list[j]
             L = ep_true.shape[0]
 
+            # 시간축(T) 패딩 및 할당
             if L >= T:
                 true_fixed[i, j] = ep_true[:T]
                 pred_fixed[i, j] = ep_pred[:T]
@@ -363,20 +339,60 @@ def load_eth_pickle_preprocessed(
 
             agent_mask[i, j] = True
 
-    N_all = N_scene
-    train_idx, test_idx = split_train_test(N_all, split_ratio, seed)
+    # 3. 데이터 분할
+    train_idx, test_idx = split_train_test(N_scene, split_ratio, seed)
+    
+    print(f"[load_eth] Normalization OFF. Units: Meters (World Coords)")
+    print(f"Total scenes: {N_scene}, Train: {len(train_idx)}, Test: {len(test_idx)}")
 
-    train_true = true_fixed[train_idx]
-    train_pred = pred_fixed[train_idx]
-    train_mask = agent_mask[train_idx]
+    return (true_fixed[train_idx], pred_fixed[train_idx], agent_mask[train_idx],
+            true_fixed[test_idx], pred_fixed[test_idx], agent_mask[test_idx])
 
-    test_true  = true_fixed[test_idx]
-    test_pred  = pred_fixed[test_idx]
-    test_mask  = agent_mask[test_idx]
 
-    print(f"[load_eth] total_scenes={N_all}, max_agents={max_agents}, train={train_true.shape[0]}, test={test_true.shape[0]}")
+def visualize_scene(true_trajs, pred_trajs, mask, scene_idx=0):
+    """
+    특정 씬(scene_idx)에 있는 모든 보행자의 실제 궤적과 예측 궤적을 그립니다.
+    """
+    plt.figure(figsize=(10, 8))
+    
+    # 해당 씬의 데이터 추출: (Max_Agents, T, 2)
+    scene_true = true_trajs[scene_idx]
+    scene_pred = pred_trajs[scene_idx]
+    scene_mask = mask[scene_idx]
+    
+    # 씬에 존재하는 보행자 수 확인
+    num_agents = np.sum(scene_mask)
+    colors = plt.cm.jet(np.linspace(0, 1, int(num_agents)))
+    
+    agent_count = 0
+    for j in range(scene_true.shape[0]):
+        if not scene_mask[j]: # 실제 보행자가 없는 슬롯은 건너뜀
+            continue
+            
+        t_traj = scene_true[j] # (T, 2)
+        p_traj = scene_pred[j] # (T, 2)
+        color = colors[agent_count]
+        
+        # 실제 궤적 (실선 + 동그라미)
+        plt.plot(t_traj[:, 0], t_traj[:, 1], color=color, linestyle='-', 
+                 marker='o', markersize=4, label=f'Agent {j} True' if agent_count < 5 else "")
+        
+        # 예측 궤적 (점선 + X)
+        plt.plot(p_traj[:, 0], p_traj[:, 1], color=color, linestyle='--', 
+                 marker='x', markersize=4, alpha=0.7, label=f'Agent {j} Pred' if agent_count < 5 else "")
+        
+        # 시작점 표시
+        plt.scatter(t_traj[0, 0], t_traj[0, 1], c='black', marker='*', s=100, zorder=5)
+        
+        agent_count += 1
 
-    return train_true, train_pred, train_mask, test_true, test_pred, test_mask
+    plt.title(f"Scene {scene_idx} Trajectory Comparison (Solid: True, Dashed: Pred)")
+    plt.xlabel("X coordinate")
+    plt.ylabel("Y coordinate")
+    plt.grid(True)
+    # 범례가 너무 많아질 수 있으므로 상위 몇 명만 표시
+    plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+    plt.show()
 
 
 # ============================================================
@@ -384,5 +400,25 @@ def load_eth_pickle_preprocessed(
 # ============================================================
 
 if __name__ == "__main__":
-    pickle_file_path = os.path.join(BASE_DIR, "predictions", "eth.pkl")
-    load_and_print_pickle(pickle_file_path)
+    # 1. 데이터 로드 설정
+    dataset_name = "eth"  # predictions/eth.pkl 파일이 있다고 가정
+    time_steps = 12       # 보고 싶은 타임스텝 수
+    
+    try:
+        # 2. 데이터 전처리 및 로드
+        (train_true, train_pred, train_mask, 
+         test_true, test_pred, test_mask) = load_eth_pickle_preprocessed(
+            dataset=dataset_name,
+            T=time_steps,
+            split_ratio=0.8
+        )
+        
+        # 3. 테스트 세트의 첫 번째 씬(index 0) 시각화
+        print(f"Visualizing test scene 0...")
+        visualize_scene(test_true, test_pred, test_mask, scene_idx=0)
+        
+    except Exception as e:
+        print(f"Error during visualization: {e}")
+        # 파일이 없을 경우 구조 확인을 위한 기존 코드 실행
+        pickle_file_path = os.path.join(BASE_DIR, "predictions", f"{dataset_name}.pkl")
+        load_and_print_pickle(pickle_file_path)
