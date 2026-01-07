@@ -319,7 +319,7 @@ class PCAGMMResidualCP:
     def fit(self, residuals: np.ndarray) -> None:
         if residuals.ndim not in (3, 4):
             raise ValueError("residuals must have ndim 3 or 4.")
-        self._residuals = residuals.astype(np.float32, copy=False)
+        self._residuals = residuals.astype(np.float32)
         if residuals.ndim == 4:
             N, T_res, H, W = residuals.shape
             self._HWD = (int(H), int(W), None)
@@ -362,32 +362,22 @@ class PCAGMMResidualCP:
             random_state=self.cfg.random_state,
         ).fit(Xi_train)
 
-        logf_cal = gmm.score_samples(Xi_cal)
-        lam = float(np.exp(np.quantile(logf_cal, alpha_gmm)))  # λ
+        weighted_log_probs = gmm._estimate_weighted_log_prob(Xi_cal) # (N_cal, K)
+        max_log_weighted_probs = np.max(weighted_log_probs, axis=1)  # (N_cal,)
+        
+        lam = float(np.exp(np.quantile(max_log_weighted_probs, alpha_gmm)))
 
-        # 4) LRW refinement: compute overlap deltas (depend only on mixture)
-        deltas = compute_deltas_LRW_QCQP(
-            gmm.weights_, gmm.means_, gmm.covariances_,
-            jitter=self.cfg.cov_jitter,
-            use_cache=True,
-        )  # (K_val,)
 
-        # 5) refined radii r_k from (λ - δ_k)/π_k (fallback if negative)
         rks = np.zeros(K_val, dtype=np.float32)
         for k in range(K_val):
             pi_k = float(gmm.weights_[k])
-            # threshold tau_k is a density level for component-k
-            if lam > float(deltas[k]):
-                threshold_k = (lam - float(deltas[k])) / pi_k
-            else:
-                # conservative fallback (matches your original spirit)
-                threshold_k = lam / (K_val * pi_k)
-
-            # rk^2 = -2 log( threshold_k * (2π)^(p/2) * sqrt(det(Sigma_k)) )
+            threshold_k = lam / pi_k 
+            
             Sigma_k = gmm.covariances_[k] + self.cfg.cov_jitter * np.eye(p_eff)
-            logZk = _log_norm_const(Sigma_k, p_eff)  # log((2π)^(p/2) sqrt(det))
+            logZk = _log_norm_const(Sigma_k, p_eff)
+            
             val_log = math.log(max(threshold_k, 1e-300)) + logZk
-            rk_sq = max(0.0, -2.0 * val_log)  # val = threshold*Z ; rk^2 = -2 log(val)
+            rk_sq = max(0.0, -2.0 * val_log)
             rks[k] = float(math.sqrt(rk_sq))
 
         return CPStepParameters(

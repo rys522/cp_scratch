@@ -119,8 +119,8 @@ def _collect_points_for_bounds(
 def _infer_world(points_xy: np.ndarray, margin: float = 2.0):
     if points_xy.size == 0:
         world_center = np.array([0.0, 0.0], dtype=np.float32)
-        box = 20.0
-        bounds = (-10.0, 10.0, -10.0, 10.0)
+        box = 40.0
+        bounds = (-20.0, 20.0, -20.0, 20.0)
         return world_center, box, bounds
 
     xmin = float(np.min(points_xy[:, 0])) - margin
@@ -421,6 +421,12 @@ def run_one_episode_visual_from_file(
     collision_count = 0
     infeasible_count = 0
 
+    # timestep-wise global coverage: 1{ true_unsafe ⊆ cp_unsafe } averaged over t
+    eval_steps = 0
+    ok_steps = 0
+    current_cov_val = 0.0
+    per_step_ok: List[bool] = []
+
     fig, axs = plt.subplots(1, 2, figsize=(14, 7), constrained_layout=True)
 
     im_heat = axs[0].imshow(
@@ -461,11 +467,11 @@ def run_one_episode_visual_from_file(
 
     def update(k: int):
         nonlocal robot_xy, robot_th, collision_count, infeasible_count, max_tracking_error
-
+        nonlocal eval_steps, ok_steps, current_cov_val, per_step_ok
         ts_key = scenario_begin + k
         if ts_key not in pred_all or ts_key not in hist_all or ts_key not in fut_all:
             status_text.set_text(
-                f"Ended | timestep={k} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
+                f"Ended | timestep={k} | Cov={current_cov_val:.2%} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
             )
             status_text.set_color("red")
             anim.event_source.stop()
@@ -474,7 +480,7 @@ def run_one_episode_visual_from_file(
         dist_to_goal = float(np.linalg.norm(robot_xy - goal))
         if dist_to_goal <= 0.6:
             status_text.set_text(
-                f"GOAL reached | timestep={k} | dist={dist_to_goal:.2f} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
+                f"GOAL reached | timestep={k} | Cov={current_cov_val:.2%} | dist={dist_to_goal:.2f} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
             )
             status_text.set_color("green")
             anim.event_source.stop()
@@ -488,7 +494,10 @@ def run_one_episode_visual_from_file(
         p_now = get_current_obs_from_history(h_dict)
 
         # Choose which future step to visualize/compare
-        i_view = 0 # 0 means t+1 in reference convention
+        i_view = 5 # 0 means t+1 in reference convention
+
+        p_future = get_future_obs_from_future_dict(f_dict, i_view)
+
 
         # Build pred tensor (H, M, 2): pred[i] corresponds to t+1+i
         pred, obst_mask, _ = stack_pred_from_p_dict(p_dict, horizon=time_horizon)
@@ -510,11 +519,31 @@ def run_one_episode_visual_from_file(
 
         safe_thresh = ROBOT_RAD + OBSTACLE_RAD
 
-        dist_now = distance_field_points(p_now - world_center, Xg, Yg) if p_now.size > 0 else np.full((grid_H, grid_W), np.inf, dtype=np.float32)
+        dist_now = distance_field_points(p_future - world_center, Xg, Yg) if p_future.size > 0 else np.full((grid_H, grid_W), np.inf, dtype=np.float32)
 
         im_true.set_data((dist_now < safe_thresh).astype(float))
         im_cp.set_data((lower_field < safe_thresh).astype(float))
         im_heat.set_data(lower_field)
+
+        # =========================
+        # timestep-wise global coverage (event indicator)
+        # event: true unsafe region is contained in CP unsafe region
+        #    ∀x: [D_true(x) < r_safe] ⇒ [D_lower(x) < r_safe]
+        # equivalently: no grid cell where true_unsafe is 1 but cp_unsafe is 0
+        # =========================
+        true_unsafe = (dist_now < safe_thresh)
+        cp_unsafe   = (lower_field < safe_thresh)
+
+        # if there are no pedestrians (dist_now is inf everywhere), then true_unsafe is all False
+        # => containment holds trivially
+        ok_t = (not np.any(true_unsafe & (~cp_unsafe)))
+
+        per_step_ok.append(bool(ok_t))
+        if k > i_view:
+            ok_steps += int(ok_t)
+            current_cov_val = ok_steps / (k - i_view)
+        else:
+            current_cov_val = 0.0
 
         # Control uses full horizon pred (still reference-aligned)
         act, info = ctrl(
@@ -526,11 +555,7 @@ def run_one_episode_visual_from_file(
             obst_mask=obst_mask,
             goal=goal,
         )
-        current_w_safety = ctrl.update_adaptive_weight(
-                    pos_x=float(robot_xy[0]), 
-                    pos_y=float(robot_xy[1]), 
-                    tracking_res=h_dict
-                )
+        safety_weight = info.get("safety_weight", 0.0)
         feasible = bool(info.get("feasible", False))
         if not feasible:
             if k > 15:
@@ -566,10 +591,12 @@ def run_one_episode_visual_from_file(
 
             # For visualization:
             # - show current observed pedestrians at time t
-            peds_scatters[ax_i].set_offsets(p_now if p_now.size else np.zeros((0, 2), dtype=np.float32))
+            peds_scatters[ax_i].set_offsets(p_future if p_future.size else np.zeros((0, 2), dtype=np.float32))
+            pred_scatters[ax_i].set_offsets(pred_i if pred_i.size else np.zeros((0, 2), dtype=np.float32))
 
         status_text.set_text(
-            f"dataset={dataset} | step={k} | "
+            f"dataset={dataset} | step={k} | Cov={current_cov_val:.2%} |"
+            f"v={v:.2f} | w={w:.2f} | safety_w={safety_weight:.2f} | "
             f"collisions={collision_count} | infeasible={infeasible_count} | "
             f"dist_goal={float(np.linalg.norm(robot_xy - goal)):.2f}"
         )
@@ -587,21 +614,21 @@ def run_one_episode_visual_from_file(
 
 
 if __name__ == "__main__":
-    DATASET = "eth"
+    DATASET = "univ"
     run_one_episode_visual_from_file(
         dataset=DATASET,
         scenario_idx=0,
         time_horizon=17,
         grid_H=128,
         grid_W=128,
-        alpha=0.05,
+        alpha=0.1,
         p_base=4,
         k_mix=5,
         test_size=0.30,
         random_state=0,
         n_jobs=max(1, (os.cpu_count() or 4) - 2),
         backend="loky",
-        n_skip=4,
-        n_paths=3000,
+        n_skip=2,
+        n_paths=1200,
         max_tracking_error=0.05,
     )
