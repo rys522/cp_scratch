@@ -346,7 +346,7 @@ class PCAGMMResidualCP:
 
         # 2) reconstruction slack epsilon (L_infty across coordinates)
         Y_recon = pca.inverse_transform(scores)
-        recon_errors = np.max(np.abs(Yw - Y_recon), axis=1)
+        recon_errors = np.max(np.maximum(Y_recon - Yw, 0), axis=1)
         Xi_train, Xi_cal, _, err_cal = train_test_split(
             scores, recon_errors,
             test_size=self.cfg.test_size,

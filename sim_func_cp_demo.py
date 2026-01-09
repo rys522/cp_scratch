@@ -494,7 +494,7 @@ def run_one_episode_visual_from_file(
         p_now = get_current_obs_from_history(h_dict)
 
         # Choose which future step to visualize/compare
-        i_view = 5 # 0 means t+1 in reference convention
+        i_view = 11 # 0 means t+1 in reference convention
 
         p_future = get_future_obs_from_future_dict(f_dict, i_view)
 
@@ -503,25 +503,25 @@ def run_one_episode_visual_from_file(
         pred, obst_mask, _ = stack_pred_from_p_dict(p_dict, horizon=time_horizon)
 
         # Predicted points at target time (t+1+i_view)
-        pred_i = pred[i_view]              # (M,2)
-        mask_i = obst_mask[i_view]         # (M,)
-        pred_pts = pred_i[mask_i]          # only valid predicted agents
-
-        # CP lower-bound field at the SAME target time (t+1+i_view)
+        current_u_adapted = g_upper_grid[i_view] + ctrl.theta_t[i_view]
+        
+        pred_i = pred[i_view]
+        mask_i = obst_mask[i_view]
+        
         lower_field = compute_lower_field_single_step(
             pred_i,
             mask_i,
             Xg,
             Yg,
-            g_upper_grid[i_view],
+            current_u_adapted,
             world_center,
         )
 
         safe_thresh = ROBOT_RAD + OBSTACLE_RAD
 
-        dist_now = distance_field_points(p_future - world_center, Xg, Yg) if p_future.size > 0 else np.full((grid_H, grid_W), np.inf, dtype=np.float32)
+        dist_i_view = distance_field_points(p_future - world_center, Xg, Yg) if p_future.size > 0 else np.full((grid_H, grid_W), np.inf, dtype=np.float32)
 
-        im_true.set_data((dist_now < safe_thresh).astype(float))
+        im_true.set_data((dist_i_view < safe_thresh).astype(float))
         im_cp.set_data((lower_field < safe_thresh).astype(float))
         im_heat.set_data(lower_field)
 
@@ -531,7 +531,7 @@ def run_one_episode_visual_from_file(
         #    ∀x: [D_true(x) < r_safe] ⇒ [D_lower(x) < r_safe]
         # equivalently: no grid cell where true_unsafe is 1 but cp_unsafe is 0
         # =========================
-        true_unsafe = (dist_now < safe_thresh)
+        true_unsafe = (dist_i_view < safe_thresh)
         cp_unsafe   = (lower_field < safe_thresh)
 
         # if there are no pedestrians (dist_now is inf everywhere), then true_unsafe is all False
@@ -554,8 +554,8 @@ def run_one_episode_visual_from_file(
             obst_pred_traj=pred,
             obst_mask=obst_mask,
             goal=goal,
+            current_obs = p_now,
         )
-        safety_weight = info.get("safety_weight", 0.0)
         feasible = bool(info.get("feasible", False))
         if not feasible:
             if k > 15:
@@ -596,7 +596,7 @@ def run_one_episode_visual_from_file(
 
         status_text.set_text(
             f"dataset={dataset} | step={k} | Cov={current_cov_val:.2%} |"
-            f"v={v:.2f} | w={w:.2f} | safety_w={safety_weight:.2f} | "
+            f"v={v:.2f} | w={w:.2f} | "
             f"collisions={collision_count} | infeasible={infeasible_count} | "
             f"dist_goal={float(np.linalg.norm(robot_xy - goal)):.2f}"
         )
@@ -614,11 +614,11 @@ def run_one_episode_visual_from_file(
 
 
 if __name__ == "__main__":
-    DATASET = "univ"
+    DATASET = "zara2"
     run_one_episode_visual_from_file(
         dataset=DATASET,
         scenario_idx=0,
-        time_horizon=17,
+        time_horizon=12,
         grid_H=128,
         grid_W=128,
         alpha=0.1,
@@ -628,7 +628,7 @@ if __name__ == "__main__":
         random_state=0,
         n_jobs=max(1, (os.cpu_count() or 4) - 2),
         backend="loky",
-        n_skip=2,
+        n_skip=4,
         n_paths=1200,
         max_tracking_error=0.05,
     )
