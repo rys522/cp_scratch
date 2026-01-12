@@ -315,17 +315,24 @@ class PCAGMMResidualCP:
         self._HWD: Optional[Tuple[Optional[int], Optional[int], Optional[int]]] = None
         self._N: Optional[int] = None
         self._T_res: Optional[int] = None
+        self._grid_shape: Optional[Tuple[int, ...]] = None
+
 
     def fit(self, residuals: np.ndarray) -> None:
-        if residuals.ndim not in (3, 4):
-            raise ValueError("residuals must have ndim 3 or 4.")
+        if residuals.ndim not in (3, 4, 5):
+            raise ValueError("residuals must have ndim 3, 4, or 5.")
         self._residuals = residuals.astype(np.float32)
-        if residuals.ndim == 4:
+
+        if residuals.ndim == 5:
+            N, T_res, nz, ny, nx = residuals.shape
+            self._grid_shape = (int(nz), int(ny), int(nx))
+        elif residuals.ndim == 4:
             N, T_res, H, W = residuals.shape
-            self._HWD = (int(H), int(W), None)
+            self._grid_shape = (int(H), int(W))
         else:
             N, T_res, D = residuals.shape
-            self._HWD = (None, None, int(D))
+            self._grid_shape = (int(D),)
+
         self._N = int(N)
         self._T_res = int(T_res)
 
@@ -333,7 +340,7 @@ class PCAGMMResidualCP:
 
     def _extract_params_for_idx(self, t_idx: int) -> CPStepParameters:
         self._assert_fitted()
-        N, Yw, H, W, D = self._get_flat_view(t_idx)
+        N, Yw, grid_shape, D = self._get_flat_view(t_idx)
         p_eff = int(min(self.cfg.p_base, N, D))
 
         alpha_eps = self.cfg.alpha_total
@@ -392,30 +399,22 @@ class PCAGMMResidualCP:
         )
 
     def _compute_upper_for_idx(self, t_idx: int) -> np.ndarray:
-        """
-        Precompute full-grid upper envelope for time index t_idx.
-        """
         p = self._extract_params_for_idx(t_idx)
         D = int(p.phi_basis.shape[1])
-
-        # In coefficient space: ellipsoid gives per-basis-direction support.
-        # For discretized functions, we lift back via AT = components^T.
         AT = p.phi_basis.T  # (D, p_eff)
 
         upper_bounds = np.zeros((p.K, D), dtype=np.float32)
         for k in range(p.K):
             center = AT @ p.mus[k]  # (D,)
-
-            # diag( A Σ A^T ) where A = AT, Σ is (p,p)
             AS = AT @ p.sigmas[k]   # (D,p)
-            quad_diag = np.einsum("dp,dp->d", AS, AT)  # length D
+            quad_diag = np.einsum("dp,dp->d", AS, AT)
             rad = p.rks[k] * np.sqrt(np.clip(quad_diag, 0.0, None))
             upper_bounds[k] = center + rad
 
         g_upper_vec = np.max(upper_bounds, axis=0) + p.epsilon
 
-        H, W, _ = self._extract_shapes()
-        return self._unflatten(g_upper_vec.astype(np.float32), H, W)
+        grid_shape = self._extract_shapes()
+        return self._unflatten(g_upper_vec.astype(np.float32), grid_shape)
 
     # ---------- public APIs ----------
 
@@ -437,11 +436,11 @@ class PCAGMMResidualCP:
     # ---------- helpers ----------
 
     def _extract_shapes(self) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-        if self._HWD is None:
-            return (None, None, None)
-        return self._HWD
+        if self._grid_shape is None:
+            return tuple()
+        return self._grid_shape
 
-    def _get_flat_view(self, t_idx: int) -> Tuple[int, np.ndarray, Optional[int], Optional[int], int]:
+    def _get_flat_view(self, t_idx: int) -> Tuple[int, np.ndarray, Tuple[int, ...], int]:
         if self._residuals is None:
             raise RuntimeError("Call fit() before accessing data.")
         if self._N is None or self._T_res is None:
@@ -452,32 +451,43 @@ class PCAGMMResidualCP:
         res = self._residuals
         N = self._N
 
+        if res.ndim == 5:
+            _, _, nz, ny, nx = res.shape
+            D = int(nz * ny * nx)
+            Yw = res[:, t_idx].reshape(N, D)
+            return N, Yw, (int(nz), int(ny), int(nx)), D
+
         if res.ndim == 4:
             _, _, H, W = res.shape
             D = int(H * W)
             Yw = res[:, t_idx].reshape(N, D)
-            return N, Yw, int(H), int(W), D
-        else:
-            D = int(res.shape[2])
-            Yw = res[:, t_idx]
-            return N, Yw, None, None, D
+            return N, Yw, (int(H), int(W)), D
 
-    def _unflatten(self, vec: np.ndarray, H: Optional[int], W: Optional[int]) -> np.ndarray:
-        if H is not None and W is not None:
+        # res.ndim == 3
+        D = int(res.shape[2])
+        Yw = res[:, t_idx]
+        return N, Yw, (int(D),), D
+
+    def _unflatten(self, vec: np.ndarray, grid_shape: Tuple[int, ...]) -> np.ndarray:
+        if len(grid_shape) == 1:
+            return vec
+        # 2D: (H,W)
+        if len(grid_shape) == 2:
+            H, W = grid_shape
             return vec.reshape(H, W)
-        return vec
+        # 3D: (nz,ny,nx)
+        if len(grid_shape) == 3:
+            nz, ny, nx = grid_shape
+            return vec.reshape(nz, ny, nx)
+        raise ValueError(f"Unsupported grid_shape: {grid_shape}")
 
     def _assert_fitted(self) -> None:
         if self._residuals is None or self._N is None or self._T_res is None:
             raise RuntimeError("PCAGMMResidualCP is not fitted. Call fit(residuals) first.")
 
     def precompute_all_from_params(self, params_list: List[CPStepParameters]) -> np.ndarray:
-        """
-        params_list: length T_res, each has ( phi_basis, mus, sigmas, rks, epsilon, ...)
-        returns: (T_res, H, W) or (T_res, D)
-        """
         self._assert_fitted()
-        H, W, _ = self._extract_shapes()
+        grid_shape = self._extract_shapes()
 
         def one(p: CPStepParameters) -> np.ndarray:
             D = int(p.phi_basis.shape[1])
@@ -485,14 +495,14 @@ class PCAGMMResidualCP:
 
             upper_bounds = np.zeros((p.K, D), dtype=np.float32)
             for k in range(p.K):
-                center = AT @ p.mus[k]          # (D,)
-                AS = AT @ p.sigmas[k]           # (D,p)
+                center = AT @ p.mus[k]
+                AS = AT @ p.sigmas[k]
                 quad_diag = np.einsum("dp,dp->d", AS, AT)
                 rad = float(p.rks[k]) * np.sqrt(np.clip(quad_diag, 0.0, None))
                 upper_bounds[k] = center + rad
 
             g_upper_vec = np.max(upper_bounds, axis=0) + float(p.epsilon)
-            return g_upper_vec.reshape(H, W) if (H is not None and W is not None) else g_upper_vec
+            return self._unflatten(g_upper_vec.astype(np.float32), grid_shape)
 
         results = Parallel(n_jobs=self.cfg.n_jobs, backend=self.cfg.backend)(
             delayed(one)(p) for p in params_list

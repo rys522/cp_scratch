@@ -10,17 +10,20 @@ from matplotlib.animation import FuncAnimation
 
 from utils import build_grid, distance_field_points
 from sims.sim_utils import (
-    compute_lower_field_single_step,
     min_dist_robot_to_peds,
     unicycle_step,
 )
-from cp.functional_cp import get_envelopes_value_and_function, CPStepParameters
+from cp.fuctional_spatial_cp import (
+    FunctionalCPConfig,
+    FunctionalCP,
+    FunctionalCPParams,
+)
+
 from controllers.func_cp_mpc import FunctionalCPMPC
-from controllers.func_cp_potential import FunctionalCPFieldController
 
 
 # ==============================================================================
-# 0) Constants (aligned to your main runner)
+# 0) Constants
 # ==============================================================================
 
 DT = 0.4
@@ -67,7 +70,7 @@ MAX_N_STEPS = {
 
 
 # ==============================================================================
-# 1) PKL loader (same convention as your main runner)
+# 1) PKL loader
 # ==============================================================================
 
 def load_prediction_results(dataset: str) -> dict:
@@ -83,7 +86,7 @@ def load_prediction_results(dataset: str) -> dict:
 
 
 # ==============================================================================
-# 2) World bounds inference from PKL (CRITICAL FIX)
+# 2) World bounds inference from PKL
 # ==============================================================================
 
 def _collect_points_for_bounds(
@@ -133,7 +136,7 @@ def _infer_world(points_xy: np.ndarray, margin: float = 2.0):
 
     xspan = xmax - xmin
     yspan = ymax - ymin
-    box = float(max(xspan, yspan))  # make square for grid
+    box = float(max(xspan, yspan))  # square for grid
 
     world_center = np.array([cx, cy], dtype=np.float32)
     return world_center, box, (xmin, xmax, ymin, ymax)
@@ -141,7 +144,7 @@ def _infer_world(points_xy: np.ndarray, margin: float = 2.0):
 
 # ==============================================================================
 # 3) Offline calibration from file: build residual tensor (N, H, Hg, Wg)
-#    (Already aligned to reference: pred[i] <-> future[i])
+#    residual = D_pred - D_true  (MIN-over-peds SDF)
 # ==============================================================================
 
 def build_training_residuals_from_file(
@@ -152,14 +155,6 @@ def build_training_residuals_from_file(
     world_center: np.ndarray,
     time_horizon: int,
 ) -> np.ndarray:
-    """
-    Build residual tensor using MIN-over-pedestrians SDF residual:
-
-        S_i(x) = D_pred_i(x) - D_true_i(x)
-              = min_m ||x - yhat_i^m|| - min_m ||x - y_i^m||
-
-    Returns: (N_scenes, H, Hg, Wg)
-    """
     pred_dict = all_data_dict["prediction"]
     fut_dict = all_data_dict["future"]
 
@@ -175,13 +170,11 @@ def build_training_residuals_from_file(
         p_scene = pred_dict[sid]  # {pid: (H,2)}
         f_scene = fut_dict[sid]   # {pid: (H,2)}
 
-        # Use only peds that exist in both pred & GT
         pids = [pid for pid in p_scene.keys() if pid in f_scene]
         if len(pids) == 0:
             continue
 
         res_i = np.zeros((Hh, Hg, Wg), dtype=np.float32)
-
         last_valid_i: Optional[int] = None
 
         for i in range(Hh):
@@ -192,7 +185,6 @@ def build_training_residuals_from_file(
                 y_pred_traj = np.asarray(p_scene[pid], dtype=np.float32)
                 y_true_traj = np.asarray(f_scene[pid], dtype=np.float32)
 
-                # sanity
                 if y_pred_traj.ndim != 2 or y_pred_traj.shape[1] != 2:
                     continue
                 if y_true_traj.ndim != 2 or y_true_traj.shape[1] != 2:
@@ -203,7 +195,6 @@ def build_training_residuals_from_file(
                 pred_pts.append(y_pred_traj[i])
                 true_pts.append(y_true_traj[i])
 
-            # If no valid peds at this horizon step, hold previous residual (or zeros if first)
             if len(pred_pts) == 0 or len(true_pts) == 0:
                 if last_valid_i is not None:
                     res_i[i] = res_i[last_valid_i]
@@ -211,12 +202,11 @@ def build_training_residuals_from_file(
                     res_i[i] = 0.0
                 continue
 
-            pred_pts = (np.asarray(pred_pts, dtype=np.float32) - world_center)  # (M,2)
-            true_pts = (np.asarray(true_pts, dtype=np.float32) - world_center)  # (M,2)
+            pred_pts = (np.asarray(pred_pts, dtype=np.float32) - world_center)
+            true_pts = (np.asarray(true_pts, dtype=np.float32) - world_center)
 
-            # MIN-over-peds distance field
-            sdf_pred = distance_field_points(pred_pts, Xg, Yg)  # (Hg,Wg)
-            sdf_true = distance_field_points(true_pts, Xg, Yg)  # (Hg,Wg)
+            sdf_pred = distance_field_points(pred_pts, Xg, Yg)
+            sdf_true = distance_field_points(true_pts, Xg, Yg)
 
             res_i[i] = sdf_pred - sdf_true
             last_valid_i = i
@@ -236,15 +226,15 @@ def calibrate_cp_from_file(
     Yg: np.ndarray,
     world_center: np.ndarray,
     time_horizon: int,
-    p_base: int,
-    k_mix: int,
     alpha: float,
     test_size: float,
     random_state: int,
     n_jobs: int,
     backend: str,
-) -> Tuple[np.ndarray, List[CPStepParameters]]:
+    rank: int = 32,
+) -> FunctionalCPParams:
     all_scenes = sorted(list(all_data["prediction"].keys()))
+
     residuals = build_training_residuals_from_file(
         all_data_dict=all_data,
         scene_ids=all_scenes,
@@ -254,21 +244,31 @@ def calibrate_cp_from_file(
         time_horizon=time_horizon,
     )
 
-    print(f"[offline] residual tensor: {residuals.shape} (N_samples, H, Hg, Wg)")
-    print("[offline] calibrating CP envelopes...")
+    print(f"[offline] residual tensor: {residuals.shape} (N_scenes, H, Hg, Wg)")
+    print("[offline] calibrating FunctionalCP params...")
 
-    g_upper_grid, cp_params = get_envelopes_value_and_function(
-        residuals_train=residuals,
-        p_base=p_base,
-        K=k_mix,
+    cfg = FunctionalCPConfig(
         alpha=alpha,
         test_size=test_size,
         random_state=random_state,
         n_jobs=n_jobs,
         backend=backend,
+        use_shared_basis=True,
+        p_base=rank,
     )
+    calibrator = FunctionalCP(cfg)
+    calibrator.fit(residuals)
+    cp_params = calibrator.extract_params(rank=rank)
+    return cp_params
 
-    return g_upper_grid.astype(np.float32), cp_params
+
+def reconstruct_S_grid(params: FunctionalCPParams, t_idx: int) -> np.ndarray:
+    """
+    S_i(x) = S_mean(x) + coeffs[i] @ phi_basis
+    returns (Hg, Wg)
+    """
+    S_flat = params.S_mean + (params.coeffs[t_idx] @ params.phi_basis)
+    return S_flat.reshape(params.grid_shape).astype(np.float32)
 
 
 # ==============================================================================
@@ -276,7 +276,6 @@ def calibrate_cp_from_file(
 # ==============================================================================
 
 def stack_pred_from_p_dict(p_dict: Dict, horizon: int) -> Tuple[np.ndarray, np.ndarray, List]:
-    # p_dict[pid][i] is prediction at (t+1+i) in reference convention
     pids = list(p_dict.keys())
     M = len(pids)
     Hh = int(horizon)
@@ -295,18 +294,12 @@ def stack_pred_from_p_dict(p_dict: Dict, horizon: int) -> Tuple[np.ndarray, np.n
 
 
 def get_current_obs_from_history(h_dict: Dict) -> np.ndarray:
-    # h_dict[pid][-1] is observation at current time t
     if len(h_dict) == 0:
         return np.zeros((0, 2), dtype=np.float32)
     return np.asarray([traj[-1] for traj in h_dict.values()], dtype=np.float32)
 
 
 def get_future_obs_from_future_dict(f_dict: Dict, i_view: int) -> np.ndarray:
-    """
-    Reference-aligned 'true' positions for comparison with pred[i_view]:
-        pred[i_view]  ~ y_{t+1+i_view}
-        future[i_view] = y_{t+1+i_view}
-    """
     if len(f_dict) == 0:
         return np.zeros((0, 2), dtype=np.float32)
 
@@ -319,7 +312,7 @@ def get_future_obs_from_future_dict(f_dict: Dict, i_view: int) -> np.ndarray:
 
 
 # ==============================================================================
-# 5) One-episode visualization (file-based) with AUTO world/grid
+# 5) One-episode visualization (file-based) with AUTO world/grid + FunctionalCP
 # ==============================================================================
 
 def run_one_episode_visual_from_file(
@@ -327,11 +320,9 @@ def run_one_episode_visual_from_file(
     *,
     scenario_idx: int = 0,
     time_horizon: int = 12,
-    grid_H: int = 16,
-    grid_W: int = 16,
-    alpha: float = 0.05,
-    p_base: int = 4,
-    k_mix: int = 5,
+    grid_H: int = 128,
+    grid_W: int = 128,
+    alpha: float = 0.10,
     test_size: float = 0.30,
     random_state: int = 0,
     n_jobs: int = 4,
@@ -339,7 +330,6 @@ def run_one_episode_visual_from_file(
     n_skip: int = 4,
     n_paths: int = 1200,
     max_steps: Optional[int] = None,
-    max_tracking_error: float = 0.1,
 ):
     if dataset not in EVAL_TASK_CONFIGS:
         raise ValueError(f"Unknown dataset: {dataset}")
@@ -354,9 +344,9 @@ def run_one_episode_visual_from_file(
     all_data = load_prediction_results(dataset)
     pred_all = all_data["prediction"]
     hist_all = all_data["history"]
-    fut_all = all_data["future"]  # <-- IMPORTANT: use future dict to align time axis
+    fut_all = all_data["future"]
 
-    # --------- AUTO world/grid inference (CRITICAL FIX) ----------
+    # --------- AUTO world/grid inference ----------
     points_xy = _collect_points_for_bounds(
         pred_all=pred_all,
         hist_all=hist_all,
@@ -377,27 +367,27 @@ def run_one_episode_visual_from_file(
     print(f"[world] inferred bounds: x=[{xmin:.2f},{xmax:.2f}] y=[{ymin:.2f},{ymax:.2f}]")
     print(f"[world] inferred box={box:.2f}, world_center={world_center.tolist()}")
 
-    # Offline calibration (same world/grid!)
-    g_upper_grid, cp_params = calibrate_cp_from_file(
+    # --------- Offline calibration (FunctionalCP params) ----------
+    cp_params = calibrate_cp_from_file(
         all_data=all_data,
         Xg=Xg,
         Yg=Yg,
         world_center=world_center,
         time_horizon=time_horizon,
-        p_base=p_base,
-        k_mix=k_mix,
         alpha=alpha,
         test_size=test_size,
         random_state=random_state,
         n_jobs=n_jobs,
         backend=backend,
+        rank=16,
     )
 
-    # Controller init (use inferred box/world_center)
     ctrl = FunctionalCPMPC(
         cp_params=cp_params,
         box=box,
         world_center=world_center,
+        grid_H=grid_H,
+        grid_W=grid_W,
         n_steps=time_horizon,
         dt=DT,
         n_skip=n_skip,
@@ -409,8 +399,6 @@ def run_one_episode_visual_from_file(
         max_angular_z=MAX_ANGULAR_Z,
         n_paths=n_paths,
         seed=0,
-        grid_H=grid_H,
-        grid_W=grid_W,
     )
 
     robot_xy = init_robot_pose[:2].astype(np.float32)
@@ -421,57 +409,76 @@ def run_one_episode_visual_from_file(
     collision_count = 0
     infeasible_count = 0
 
-    # timestep-wise global coverage: 1{ true_unsafe ⊆ cp_unsafe } averaged over t
-    eval_steps = 0
+    # timestep-wise containment coverage for i_view
     ok_steps = 0
+    eval_steps = 0
     current_cov_val = 0.0
-    per_step_ok: List[bool] = []
 
     fig, axs = plt.subplots(1, 2, figsize=(14, 7), constrained_layout=True)
 
+    # 왼쪽: lower_field(거리필드)
     im_heat = axs[0].imshow(
         np.zeros((grid_H, grid_W), dtype=np.float32),
         extent=extent,
         origin="lower",
         cmap="viridis_r",
-        vmin=0,
-        vmax=10,
     )
     plt.colorbar(im_heat, ax=axs[0], fraction=0.046, pad=0.04)
-    axs[0].set_title("CP lower-bound field (grid viz only)")
+    axs[0].set_title("Lower distance field")
 
-    axs[1].set_title(f"Unsafe region: True vs CP (alpha={alpha})")
-    im_true = axs[1].imshow(np.zeros((grid_H, grid_W)), extent=extent, origin="lower", cmap="Blues", vmin=0, vmax=1, alpha=0.4)
-    im_cp = axs[1].imshow(np.zeros((grid_H, grid_W)), extent=extent, origin="lower", cmap="Reds", vmin=0, vmax=1, alpha=0.5)
+    axs[1].set_title(f"Unsafe set comparison at i_view (alpha={alpha})")
+    im_true = axs[1].imshow(
+        np.zeros((grid_H, grid_W)),
+        extent=extent,
+        origin="lower",
+        cmap="Blues",
+        vmin=0,
+        vmax=1,
+        alpha=0.35,
+    )
+    im_cp = axs[1].imshow(
+        np.zeros((grid_H, grid_W)),
+        extent=extent,
+        origin="lower",
+        cmap="Reds",
+        vmin=0,
+        vmax=1,
+        alpha=0.50,
+    )
 
-    robot_dots, traj_lines, plan_lines, peds_scatters, pred_scatters = [], [], [], [], []
+    robot_dots, traj_lines, plan_lines, obs_scatters, pred_scatters, gt_scatters = [], [], [], [], [], []
     for ax in axs:
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         ax.set_aspect("equal")
-        ax.plot(goal[0], goal[1], "gx", ms=12, mew=2)
+        ax.grid(True, alpha=0.20)
+        ax.plot(goal[0], goal[1], "g*", ms=12, mew=0.8)
 
-        dot, = ax.plot([], [], "bo", ms=7, zorder=5)
-        line, = ax.plot([], [], "b-", lw=1, alpha=0.5)
+        dot, = ax.plot([], [], "bo", ms=7, zorder=6)
+        line, = ax.plot([], [], "b-", lw=1.2, alpha=0.60, zorder=5)
         plan_p, = ax.plot([], [], "c--", lw=1.5, zorder=4)
-        peds = ax.scatter([], [], s=25, edgecolors="black", zorder=6)
-        pred_sc = ax.scatter([], [], s=40, marker="x", zorder=7)
+
+        obs_sc = ax.scatter([], [], s=25, edgecolors="black", zorder=7)      # now
+        pred_sc = ax.scatter([], [], s=40, marker="x", zorder=8)             # pred i_view
+        gt_sc = ax.scatter([], [], s=40, marker="D", zorder=9)               # GT i_view
 
         robot_dots.append(dot)
         traj_lines.append(line)
         plan_lines.append(plan_p)
-        peds_scatters.append(peds)
+        obs_scatters.append(obs_sc)
         pred_scatters.append(pred_sc)
+        gt_scatters.append(gt_sc)
 
     status_text = fig.text(0.5, 0.02, "", ha="center", fontsize=10, fontweight="bold")
 
     def update(k: int):
-        nonlocal robot_xy, robot_th, collision_count, infeasible_count, max_tracking_error
-        nonlocal eval_steps, ok_steps, current_cov_val, per_step_ok
+        nonlocal robot_xy, robot_th, collision_count, infeasible_count
+        nonlocal eval_steps, ok_steps, current_cov_val
+
         ts_key = scenario_begin + k
         if ts_key not in pred_all or ts_key not in hist_all or ts_key not in fut_all:
             status_text.set_text(
-                f"Ended | timestep={k} | Cov={current_cov_val:.2%} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
+                f"Ended | step={k} | Cov={current_cov_val:.2%} | infeasible={infeasible_count} | collisions={collision_count}"
             )
             status_text.set_color("red")
             anim.event_source.stop()
@@ -480,72 +487,76 @@ def run_one_episode_visual_from_file(
         dist_to_goal = float(np.linalg.norm(robot_xy - goal))
         if dist_to_goal <= 0.6:
             status_text.set_text(
-                f"GOAL reached | timestep={k} | Cov={current_cov_val:.2%} | dist={dist_to_goal:.2f} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
+                f"GOAL reached | step={k} | Cov={current_cov_val:.2%} | dist={dist_to_goal:.2f}"
             )
             status_text.set_color("green")
             anim.event_source.stop()
             return []
 
-        p_dict = pred_all[ts_key]   # predictions at t: give (t+1..t+H)
-        h_dict = hist_all[ts_key]   # history up to t: last = y_t
-        f_dict = fut_all[ts_key]    # future at t: gives (t+1..t+H) GT
+        p_dict = pred_all[ts_key]   # dict(pid -> (H,2))  for t
+        h_dict = hist_all[ts_key]   # dict(pid -> (hist,2))
+        f_dict = fut_all[ts_key]    # dict(pid -> (H,2))  GT future
 
-        # Current observed positions at time t (used for collision check only)
-        p_now = get_current_obs_from_history(h_dict)
+        # current observed peds at time t
+        obs_now = get_current_obs_from_history(h_dict)
 
-        # Choose which future step to visualize/compare
-        i_view = 11 # 0 means t+1 in reference convention
+        # choose i_view (0 => t+1)
+        i_view = 7
+        i_view = int(np.clip(i_view, 0, time_horizon - 1))
 
-        p_future = get_future_obs_from_future_dict(f_dict, i_view)
+        # GT future at i_view
+        gt_i = get_future_obs_from_future_dict(f_dict, i_view)
 
-
-        # Build pred tensor (H, M, 2): pred[i] corresponds to t+1+i
+        # predictions tensor (H,M,2)
         pred, obst_mask, _ = stack_pred_from_p_dict(p_dict, horizon=time_horizon)
-
-        # Predicted points at target time (t+1+i_view)
-        current_u_adapted = g_upper_grid[i_view] + ctrl.theta_t[i_view]
-        
         pred_i = pred[i_view]
         mask_i = obst_mask[i_view]
-        
-        lower_field = compute_lower_field_single_step(
-            pred_i,
-            mask_i,
-            Xg,
-            Yg,
-            current_u_adapted,
-            world_center,
-        )
+        pred_i_vis = pred_i[mask_i] if pred_i.size else np.zeros((0, 2), dtype=np.float32)
 
+        # -------------------------
+        # FunctionalCP lower field:
+        # D_pred - U_i
+        # -------------------------
         safe_thresh = ROBOT_RAD + OBSTACLE_RAD
 
-        dist_i_view = distance_field_points(p_future - world_center, Xg, Yg) if p_future.size > 0 else np.full((grid_H, grid_W), np.inf, dtype=np.float32)
+        if pred_i_vis.size > 0:
+            D_pred = distance_field_points(pred_i_vis - world_center, Xg, Yg)
+        else:
+            D_pred = np.full((grid_H, grid_W), np.inf, dtype=np.float32)
 
-        im_true.set_data((dist_i_view < safe_thresh).astype(float))
+        # U_i(x) = rho_i * S_i(x)
+        S_i = reconstruct_S_grid(cp_params, i_view)  # (Hg,Wg)
+        U_i = float(cp_params.rhos[i_view]) * np.maximum(S_i, 1e-9)
+
+        lower_field = np.maximum(D_pred - U_i, 0.0)
+
+        # GT distance field at i_view (for coverage + viz)
+        if gt_i.size > 0:
+            D_true = distance_field_points(gt_i - world_center, Xg, Yg)
+        else:
+            D_true = np.full((grid_H, grid_W), np.inf, dtype=np.float32)
+
+        # viz
+        im_true.set_data((D_true < safe_thresh).astype(float))
         im_cp.set_data((lower_field < safe_thresh).astype(float))
         im_heat.set_data(lower_field)
 
-        # =========================
-        # timestep-wise global coverage (event indicator)
-        # event: true unsafe region is contained in CP unsafe region
-        #    ∀x: [D_true(x) < r_safe] ⇒ [D_lower(x) < r_safe]
-        # equivalently: no grid cell where true_unsafe is 1 but cp_unsafe is 0
-        # =========================
-        true_unsafe = (dist_i_view < safe_thresh)
-        cp_unsafe   = (lower_field < safe_thresh)
-
-        # if there are no pedestrians (dist_now is inf everywhere), then true_unsafe is all False
-        # => containment holds trivially
+        # -------------------------
+        # containment coverage @ i_view
+        # true_unsafe ⊆ cp_unsafe  (grid-wise)
+        # -------------------------
+        true_unsafe = (D_true < safe_thresh)
+        cp_unsafe = (lower_field < safe_thresh)
         ok_t = (not np.any(true_unsafe & (~cp_unsafe)))
 
-        per_step_ok.append(bool(ok_t))
         if k > i_view:
+            eval_steps += 1
             ok_steps += int(ok_t)
-            current_cov_val = ok_steps / (k - i_view)
+            current_cov_val = ok_steps / max(1, eval_steps)
         else:
             current_cov_val = 0.0
 
-        # Control uses full horizon pred (still reference-aligned)
+        # Control uses full horizon pred
         act, info = ctrl(
             pos_x=float(robot_xy[0]),
             pos_y=float(robot_xy[1]),
@@ -554,7 +565,7 @@ def run_one_episode_visual_from_file(
             obst_pred_traj=pred,
             obst_mask=obst_mask,
             goal=goal,
-            current_obs = p_now,
+            current_obs=obs_now,
         )
         feasible = bool(info.get("feasible", False))
         if not feasible:
@@ -563,23 +574,22 @@ def run_one_episode_visual_from_file(
             v, w = 0.0, 0.0
         else:
             v, w = float(act[0]), float(act[1])
+
         if k <= 15:
             v, w = 0.0, 0.0
 
         plan = info.get("final_path", None)
 
-        # Collision check MUST use current observed positions at time t
-        # (not future positions)
-
-        if p_now.size == 0:
+        # collision check uses current obs_now
+        if obs_now.size == 0:
             dmin = np.inf
         else:
-            dmin = float(min_dist_robot_to_peds(robot_xy, p_now))
-        is_coll = dmin < safe_thresh
+            dmin = float(min_dist_robot_to_peds(robot_xy, obs_now))
+        is_coll = (dmin < safe_thresh)
         if is_coll and k > 15:
             collision_count += 1
 
-        traj = np.stack(robot_traj)
+        traj = np.stack(robot_traj, axis=0)
 
         for ax_i in range(2):
             robot_dots[ax_i].set_data([robot_xy[0]], [robot_xy[1]])
@@ -588,25 +598,25 @@ def run_one_episode_visual_from_file(
 
             if plan is not None:
                 plan_lines[ax_i].set_data(plan[:, 0], plan[:, 1])
+            else:
+                plan_lines[ax_i].set_data([], [])
 
-            # For visualization:
-            # - show current observed pedestrians at time t
-            peds_scatters[ax_i].set_offsets(p_future if p_future.size else np.zeros((0, 2), dtype=np.float32))
-            pred_scatters[ax_i].set_offsets(pred_i if pred_i.size else np.zeros((0, 2), dtype=np.float32))
+            # show current observed (●), pred(i_view)(×), gt(i_view)(◆)
+            obs_scatters[ax_i].set_offsets(obs_now if obs_now.size else np.zeros((0, 2), dtype=np.float32))
+            pred_scatters[ax_i].set_offsets(pred_i_vis if pred_i_vis.size else np.zeros((0, 2), dtype=np.float32))
+            gt_scatters[ax_i].set_offsets(gt_i if gt_i.size else np.zeros((0, 2), dtype=np.float32))
 
         status_text.set_text(
-            f"dataset={dataset} | step={k} | Cov={current_cov_val:.2%} |"
-            f"v={v:.2f} | w={w:.2f} | "
-            f"collisions={collision_count} | infeasible={infeasible_count} | "
+            f"{dataset} | step={k} | i_view={i_view} | contain-Cov={current_cov_val:.2%} | "
+            f"v={v:.2f}, w={w:.2f} | "
+            f"coll={collision_count}, infeas={infeasible_count} | "
             f"dist_goal={float(np.linalg.norm(robot_xy - goal)):.2f}"
         )
         status_text.set_color("red" if (is_coll or not feasible) else "black")
 
-        # Update robot
+        # step robot
         robot_xy, robot_th = unicycle_step(robot_xy, robot_th, v, w, DT)
         robot_traj.append(robot_xy.copy())
-
-
         return []
 
     anim = FuncAnimation(fig, update, frames=max_n_steps, interval=100, blit=False, repeat=False)
@@ -614,7 +624,7 @@ def run_one_episode_visual_from_file(
 
 
 if __name__ == "__main__":
-    DATASET = "zara2"
+    DATASET = "univ"
     run_one_episode_visual_from_file(
         dataset=DATASET,
         scenario_idx=0,
@@ -622,13 +632,10 @@ if __name__ == "__main__":
         grid_H=128,
         grid_W=128,
         alpha=0.1,
-        p_base=4,
-        k_mix=5,
         test_size=0.30,
         random_state=0,
         n_jobs=max(1, (os.cpu_count() or 4) - 2),
         backend="loky",
         n_skip=4,
         n_paths=1200,
-        max_tracking_error=0.05,
     )

@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from collections import deque
 
 import math
 import time
 import numpy as np
+
+from cp.fuctional_spatial_cp import FunctionalCPParams
 
 
 def min_dist_robot_to_peds(robot_xy, peds_xy):
@@ -30,37 +31,28 @@ class FuncMPCWeights:
     w_intermediate: float = 1.0
     w_control: float = 0.001
 
-    # soft-safety shaping (kept, although you currently filter hard by CP)
-    w_safety: float = 10.0
-    w_margin: float = 10.0
-    safety_scale: float = 0.2
-
 
 # =============================================================================
-# Functional CP-MPC Controller (MODULATED RESIDUAL CP VERSION)
+# Functional CP-MPC Controller (FUNCTIONAL CP VERSION, HARD FILTER ONLY)
 # =============================================================================
 
 class FunctionalCPMPC:
     """
-    Functional CP-informed Monte Carlo MPC controller.
+    Functional CP-informed Monte Carlo MPC controller (hard filtering only).
 
-    This version assumes you already computed an offline, horizon-indexed residual envelope:
-        U[i, ...]  (e.g., (H, Hg, Wg))
+    FunctionalCPParams encodes residual field basis:
+        S_i(x) = S_mean(x) + coeffs[i] @ phi_basis[:, x]
+        U_i(x) = rhos[i] * max(S_i(x), eps)
 
-    Online evaluation is just a grid lookup:
-        U_i(x_world) = U[i, grid(x_world)]
-    and then:
-        d_lower = max(d_nom - (U_i(x)+theta_i), 0).
-
-    NOTE:
-    - No GMM / PCA / basis vectors are used.
-    - CPStepParameters is removed.
+    Safety filtering uses:
+        d_lower = max(d_nom - U_i(x), 0)
+        keep path if d_lower >= safe_rad for all steps along the horizon
     """
 
     def __init__(
         self,
         *,
-        residual_envelopes: np.ndarray,     # (H, Hg, Wg) or (H, D)
+        cp_params: FunctionalCPParams,
         box: float,
         world_center: np.ndarray,
         grid_H: int,
@@ -77,22 +69,12 @@ class FunctionalCPMPC:
         n_paths: int,
         seed: int = 0,
         weights: Optional[FuncMPCWeights] = None,
-        risk_level: float = 1.0,
-        step_size: float = 9.0,
+        eps_S: float = 1e-9,
     ):
         # Workspace/grid configuration
         self.box = float(box)
         self.world_center = np.asarray(world_center, dtype=np.float32)
         self.grid_H, self.grid_W = int(grid_H), int(grid_W)
-
-        # Offline residual envelopes U_i(x)
-        self.U = np.asarray(residual_envelopes, dtype=np.float32)
-        if self.U.ndim not in (2, 3):
-            raise ValueError("residual_envelopes must have shape (H,D) or (H,Hg,Wg).")
-        if self.U.shape[0] != int(n_steps):
-            # If you want U for horizon H but MPC horizon differs, you can relax this,
-            # but for now keep it strict to avoid silent misalignment.
-            raise ValueError(f"residual_envelopes has H={self.U.shape[0]} but n_steps={n_steps}.")
 
         # MPC rollout configuration
         self.n_steps = int(n_steps)
@@ -112,32 +94,53 @@ class FunctionalCPMPC:
         self.n_paths = int(n_paths)
         self.rng = np.random.default_rng(int(seed))
         self.weights = weights or FuncMPCWeights()
-        self.last_best_vels: Optional[np.ndarray] = None  # warm-start storage
+        self.last_best_vels: Optional[np.ndarray] = None
 
-        # Adaptive soft-safety tuning (not essential for hard filtering, kept)
-        self._target_slack = float(risk_level)
-        self._eta = float(step_size)
+        # Functional CP params
+        self.cp_params = cp_params
+        self.eps_S = float(eps_S)
 
-        # -----------------------------
-        # Online CP calibration (optional)
-        # -----------------------------
-        # theta_t[idx] is an additive bias for the offline envelope U at step idx (0-based)
-        self.theta_t = np.zeros(self.n_steps, dtype=np.float32)
-        self.gamma_t = np.ones(self.n_steps, dtype=np.float32)  # kept if you still want it; not used here
+        # Sanity checks / alignment
+        if int(self.cp_params.grid_shape[0]) != self.grid_H or int(self.cp_params.grid_shape[1]) != self.grid_W:
+            raise ValueError(
+                f"cp_params.grid_shape={self.cp_params.grid_shape} "
+                f"but controller grid={(self.grid_H, self.grid_W)}"
+            )
+        if int(self.cp_params.rhos.shape[0]) != self.n_steps:
+            raise ValueError(f"cp_params.rhos has H={self.cp_params.rhos.shape[0]} but n_steps={self.n_steps}")
+        if int(self.cp_params.coeffs.shape[0]) != self.n_steps:
+            raise ValueError(f"cp_params.coeffs has H={self.cp_params.coeffs.shape[0]} but n_steps={self.n_steps}")
 
-        # online update hyperparams
-        self.cp_alpha = 0.1
-        self.cp_eta = 0.01
-        self.theta_min = -2.0
-        self.theta_max = 2.0
+        # Flattened grid size D
+        self.D = int(self.grid_H * self.grid_W)
+
+        # S_mean is expected flattened (D,)
+        self.S_mean = np.asarray(self.cp_params.S_mean, dtype=np.float32).reshape(-1)
+        if self.S_mean.shape[0] != self.D:
+            raise ValueError(f"cp_params.S_mean has D={self.S_mean.shape[0]} but expected {self.D}")
+
+        # coeffs: (H, r)
+        self.coeffs = np.asarray(self.cp_params.coeffs, dtype=np.float32)
+        # phi_basis: (r, D) (recommended) OR (D, r) (we accept and transpose)
+        self.phi = np.asarray(self.cp_params.phi_basis, dtype=np.float32)
+
+        if self.phi.ndim != 2:
+            raise ValueError("cp_params.phi_basis must be 2D")
+
+        r = int(self.coeffs.shape[1])
+        if self.phi.shape == (r, self.D):
+            pass
+        elif self.phi.shape == (self.D, r):
+            self.phi = self.phi.T  # -> (r, D)
+        else:
+            raise ValueError(
+                f"phi_basis shape mismatch. Expected (r,D)=({r},{self.D}) or (D,r)=({self.D},{r}), got {self.phi.shape}"
+            )
+
+        self.rhos = np.asarray(self.cp_params.rhos, dtype=np.float32).reshape(self.n_steps,)
 
         # Simulation timestep counter
         self.step_count = 0
-
-        # Store past plans for delayed online updates
-        self.prediction_history = deque(maxlen=self.n_steps + 1)
-
-        self._cp_debug = True
 
     # ---------------------------------------------------------------------
     # Grid geometry helpers (world <-> grid)
@@ -160,45 +163,14 @@ class FunctionalCPMPC:
         return i * self.grid_W + j
 
     # ---------------------------------------------------------------------
-    # Adaptive update helper (kept)
+    # Functional CP evaluation: U_i(x)
     # ---------------------------------------------------------------------
 
-    def update_online_cp(self, *, current_obs, robot_pos_world: np.ndarray, safety_pred: bool, idx: int):
-        if current_obs is None:
-            return
-        if not np.all(np.isfinite(np.asarray(current_obs))):
-            return
-
-        x_now = np.asarray(robot_pos_world, dtype=np.float32).reshape(2,)
-        d_true = float(min_dist_robot_to_peds(x_now, current_obs))
-        if not np.isfinite(d_true):
-            return
-
-        safety_pred = bool(safety_pred)
-        true_safety = (d_true >= self.safe_rad)
-
-        # FP: predicted unsafe but actually safe -> decrease theta (less conservative)
-        if true_safety and (not safety_pred):
-            self.theta_t[idx] = float(np.clip(self.theta_t[idx] - self.cp_eta, self.theta_min, self.theta_max))
-            self.gamma_t[idx] = float(max(self.gamma_t[idx] - 0.01, 0.0))
-
-        # FN: predicted safe but actually unsafe -> increase theta (more conservative)
-        elif (not true_safety) and safety_pred:
-            self.theta_t[idx] = float(np.clip(self.theta_t[idx] + self.cp_eta, self.theta_min, self.theta_max))
-            self.gamma_t[idx] = float(self.gamma_t[idx] + 0.01)
-
-        if self._cp_debug:
-            print(
-                f"[CP Online Update] idx={idx}, d_true={d_true:.3f}, "
-                f"true_safety={true_safety}, safety_pred={safety_pred}, theta={self.theta_t[idx]:.3f}, gamma={self.gamma_t[idx]:.3f}"
-            )
-
-    # ---------------------------------------------------------------------
-    # Residual envelope evaluation: U_i(x)
-    # ---------------------------------------------------------------------
-
-    def _evaluate_U_offline(self, pos_world: np.ndarray, t_idx: int) -> float:
-        """Evaluate ONLY offline envelope U_i(x) by grid lookup."""
+    def evaluate_U(self, pos_world: np.ndarray, t_idx: int) -> float:
+        """
+        U_i(x) = rho_i * max( S_i(x), eps )
+        S_i(x) = S_mean(x) + coeffs[i] @ phi_basis[:, x]
+        """
         idx = int(t_idx)
         if not (0 <= idx < self.n_steps):
             return 1.0
@@ -207,20 +179,15 @@ class FunctionalCPMPC:
         if ij is None:
             return 1.0
 
-        if self.U.ndim == 3:
-            i, j = ij
-            return float(self.U[idx, i, j])
-        else:
-            flat = self._grid_flat_index(ij)
-            return float(self.U[idx, flat])
+        flat = self._grid_flat_index(ij)  # in [0, D)
+        # S_mean(x)
+        s = float(self.S_mean[flat])
+        # + coeffs[i] @ phi[:, flat]
+        # (r,) dot (r,)
+        s += float(np.dot(self.coeffs[idx], self.phi[:, flat]))
+        s = max(s, self.eps_S)
 
-    def evaluate_U(self, pos_world: np.ndarray, t_idx: int) -> float:
-        """Evaluate offline envelope plus online theta."""
-        u = self._evaluate_U_offline(pos_world, int(t_idx))
-        idx = int(t_idx)
-        if 0 <= idx < self.theta_t.shape[0]:
-            u = self.gamma_t[idx] * u + float(self.theta_t[idx])
-        return float(u)
+        return float(self.rhos[idx] * s)
 
     # ---------------------------------------------------------------------
     # Public MPC API
@@ -237,31 +204,11 @@ class FunctionalCPMPC:
         *,
         obst_pred_traj: Optional[np.ndarray] = None,  # (H, M, 2) or (H,2)
         obst_mask: Optional[np.ndarray] = None,       # (H, M) or (H,)
-        current_obs: Optional[np.ndarray] = None,
+        current_obs: Optional[np.ndarray] = None,     # kept only for external collision stats; not used here
     ):
         if goal is None:
             raise ValueError("goal must be provided.")
         goal = np.asarray(goal, dtype=np.float32)
-
-        if current_obs is not None:
-            now = int(self.step_count)
-            new_q = deque(maxlen=self.prediction_history.maxlen)
-
-            while self.prediction_history:
-                h = self.prediction_history.popleft()
-                if int(h["due_time"]) == now:
-                    t_idx = int(h["horizon"]) - 1
-                    if 0 <= t_idx < self.n_steps:
-                        self.update_online_cp(
-                            current_obs=current_obs,
-                            robot_pos_world=h["pos"],
-                            safety_pred=bool(h["safety_pred"]),
-                            idx=t_idx,
-                        )
-                else:
-                    new_q.append(h)
-
-            self.prediction_history = new_q
 
         # Normalize dynamic predictions if obst_pred_traj provided
         if obst_pred_traj is not None:
@@ -302,14 +249,14 @@ class FunctionalCPMPC:
                 "counts": stats,
             }
 
-        # 3) Score feasible candidates (currently only goal+effort)
+        # 3) Score feasible candidates (goal+effort only)
         t_score0 = time.perf_counter()
-        best_idx, best_cost = self.score_paths(safe_paths, safe_vels, goal, predictions)
+        best_idx, best_cost = self.score_paths(safe_paths, safe_vels, goal)
+        self.last_best_vels = safe_vels[best_idx].copy()
         t_score1 = time.perf_counter()
 
         act = np.asarray(safe_vels[best_idx, 0], dtype=np.float32)
         best_path = safe_paths[best_idx]
-        self.last_best_vels = safe_vels[best_idx].copy()
 
         info = {
             "feasible": True,
@@ -322,7 +269,6 @@ class FunctionalCPMPC:
                 "score_ms": (t_score1 - t_score0) * 1000.0,
             },
             "counts": stats,
-            "theta_mean": float(np.mean(self.theta_t)),
         }
 
         self.step_count += 1
@@ -376,14 +322,14 @@ class FunctionalCPMPC:
         vels: np.ndarray,            # (P, T, 2)
         boxes: List[Any],
         predictions: Dict[Any, np.ndarray],
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float, Optional[List[Tuple[int, np.ndarray]]]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float]:
         P, T1, _ = paths.shape
         T = T1 - 1
 
         boxes = boxes or []
         predictions = predictions or {}
 
-        # (A) Static obstacles
+        # (A) Static obstacles (same as before)
         mask_static_unsafe = np.zeros(P, dtype=bool)
         if len(boxes) > 0:
             for box in boxes:
@@ -401,7 +347,7 @@ class FunctionalCPMPC:
                 coll = np.any(np.all((transformed >= lb) & (transformed <= ub), axis=-1), axis=-1)
                 mask_static_unsafe |= coll
 
-        # (B) Dynamic obstacles with CP envelope
+        # (B) Dynamic obstacles with Functional CP envelope (hard)
         mask_dynamic_unsafe = np.zeros(P, dtype=bool)
         cp_violation = 0.0
 
@@ -421,16 +367,9 @@ class FunctionalCPMPC:
                     U = self.evaluate_U(x, t)
                     d_lower = max(d_nom - U, 0.0)
 
-                    self.prediction_history.append({
-                        "pos": x.copy(),
-                        "horizon": t + 1 ,
-                        "pred_time" : self.step_count,
-                        "due_time" : self.step_count + t +1,
-                        "safety_pred" : d_lower >= self.safe_rad,
-                    })
-
                     if d_lower < self.safe_rad:
                         mask_dynamic_unsafe[i] = True
+                        break  # early exit for this path
 
         mask_safe = ~(mask_static_unsafe | mask_dynamic_unsafe)
 
@@ -484,7 +423,7 @@ class FunctionalCPMPC:
         return paths, vels
 
     # ---------------------------------------------------------------------
-    # Scoring
+    # Scoring (goal + control only)
     # ---------------------------------------------------------------------
 
     def score_paths(
@@ -492,7 +431,6 @@ class FunctionalCPMPC:
         paths: np.ndarray,                # (P, T+1, 2)
         vels: np.ndarray,                 # (P, T, 2)
         goal: np.ndarray,                 # (2,)
-        predictions: Dict[Any, np.ndarray],
     ) -> Tuple[int, float]:
         intermediate = self.weights.w_intermediate * np.sum((paths[:, :-1, :] - goal) ** 2, axis=(-2, -1))
         terminal = self.weights.w_terminal * np.sum((paths[:, -1, :] - goal) ** 2, axis=-1)
