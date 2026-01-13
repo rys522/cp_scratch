@@ -298,6 +298,7 @@ class FunctionalCPMPC3D:
 
             d_lower = np.maximum(d_nom - U_vec, 0.0)
             unsafe |= (d_lower < self.safe_rad)
+            #unsafe |= (d_nom < self.safe_rad) 22 17
 
         return unsafe
 

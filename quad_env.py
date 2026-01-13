@@ -186,6 +186,8 @@ class ObstacleAgent:
     pid: int
     pos: np.ndarray  # (3,)
     vel: np.ndarray  # (3,)
+    mode: int = 0          # 0: CV-ish, 1: turn, 2: wander, 3: stop-go
+    mode_ttl: int = 0   
 
 class CVPredictor3D:
     def __init__(self, dt: float, horizon: int, process_noise_std: float = 0.0):
@@ -256,6 +258,11 @@ class QuadWorldEnv3D:
         goal_xyz: Optional[np.ndarray] = None,        # (3,)
         gt_future_noise: float = 0.0,                 # oracle future noise
         oracle_seed_offset: int = 12345,              # to separate oracle rng
+        mode_switch_p: float = 0.05,     # 매 step mode 바뀔 확률
+        mode_min_ttl: int = 5,
+        mode_max_ttl: int = 25,
+        turn_rate_std: float = 1.2,     # turn 모드에서 방향 변동 강도
+        stop_go_p: float = 0.10,            # stop-go 모드에서 멈췄다 출발할 확률
     ):
         self.dt = float(dt)
         self.H = int(horizon)
@@ -270,6 +277,12 @@ class QuadWorldEnv3D:
         self.oracle_rng = np.random.default_rng(int(seed) + int(oracle_seed_offset))
 
         self.predictor = CVPredictor3D(dt=self.dt, horizon=self.H, process_noise_std=pred_model_noise)
+
+        self.mode_switch_p = float(mode_switch_p)
+        self.mode_min_ttl = int(mode_min_ttl)
+        self.mode_max_ttl = int(mode_max_ttl)
+        self.turn_rate_std = float(turn_rate_std)
+        self.stop_go_p = float(stop_go_p)
 
         # fixed start/goal
         if start_xyz_yaw is None:
@@ -305,7 +318,7 @@ class QuadWorldEnv3D:
                 self.rng.uniform(*self.zlim),
             ], dtype=np.float32)
 
-            vel = self.rng.normal(0, 0.6, size=(3,)).astype(np.float32)
+            vel = self.rng.normal(0, 1, size=(3,)).astype(np.float32)
             vel[2] *= 0.3
             self.obstacles.append(ObstacleAgent(pid=pid, pos=pos, vel=vel))
             self.history_xyz[pid] = [pos.copy()]
@@ -337,9 +350,46 @@ class QuadWorldEnv3D:
 
     def _step_obstacles(self):
         for ob in self.obstacles:
+            # --- mode switching ---
+            if ob.mode_ttl <= 0 or self.rng.random() < self.mode_switch_p:
+                ob.mode = int(self.rng.integers(0, 4))
+                ob.mode_ttl = int(self.rng.integers(self.mode_min_ttl, self.mode_max_ttl))
+            ob.mode_ttl -= 1
+
+            # base acceleration noise
             a = self.rng.normal(0, self.obs_process_noise, size=(3,)).astype(np.float32)
             a[2] *= 0.3
-            ob.vel = ob.vel + a * self.dt
+
+            v = ob.vel.copy()
+
+            if ob.mode == 0:
+                # CV-ish: 기존과 비슷
+                v = v + a * self.dt
+
+            elif ob.mode == 1:
+                # turn: xy평면에서 방향이 계속 휘어짐 (CV가 특히 약함)
+                ang = float(self.rng.normal(0, self.turn_rate_std)) * self.dt
+                c, s = np.cos(ang), np.sin(ang)
+                vx, vy = float(v[0]), float(v[1])
+                v[0] = c * vx - s * vy
+                v[1] = s * vx + c * vy
+                v = v + a * self.dt
+
+            elif ob.mode == 2:
+                # wander: 속도 자체를 랜덤 타겟으로 끌어당김 (Ornstein-Uhlenbeck 느낌)
+                v_target = self.rng.normal(0, 0.8, size=(3,)).astype(np.float32)
+                v_target[2] *= 0.3
+                tau = 1.5  # 작을수록 더 급격
+                v = v + (v_target - v) * (self.dt / tau) + a * self.dt
+
+            else:
+                # stop-go: 확률적으로 거의 멈췄다가 다시 움직임
+                if self.rng.random() < self.stop_go_p:
+                    v *= 0.1
+                else:
+                    v = v + a * self.dt
+
+            ob.vel = v
             ob.pos = ob.pos + ob.vel * self.dt
             ob.pos, ob.vel = self._reflect_bounds(ob.pos, ob.vel)
 

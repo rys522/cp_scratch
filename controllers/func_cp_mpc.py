@@ -6,19 +6,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import math
 import time
+
 import numpy as np
 
-from cp.fuctional_spatial_cp import FunctionalCPParams
-
-
-def min_dist_robot_to_peds(robot_xy, peds_xy):
-    if peds_xy is None:
-        return float("inf")
-    peds_xy = np.asarray(peds_xy, dtype=np.float32)
-    if peds_xy.size == 0:
-        return float("inf")
-    d = peds_xy - np.asarray(robot_xy, dtype=np.float32)[None, :]
-    return float(np.sqrt(np.sum(d * d, axis=1)).min())
+# NOTE:
+# - CPStepParameters is assumed to be produced offline for each horizon index (time-to-go),
+#   and cached for online pointwise queries along rollouts.
+from cp.functional_cp import CPStepParameters
 
 
 # =============================================================================
@@ -27,32 +21,71 @@ def min_dist_robot_to_peds(robot_xy, peds_xy):
 
 @dataclass
 class FuncMPCWeights:
+    """
+    Weights for the MPC objective.
+
+    The controller uses:
+      - goal tracking (intermediate + terminal),
+      - control effort penalty,
+      - soft safety shaping (optional), with a separate adaptive multiplier.
+
+    Parameters
+    ----------
+    w_terminal : float
+        Terminal goal tracking weight.
+    w_intermediate : float
+        Intermediate goal tracking weight (sum along the horizon).
+    w_control : float
+        Control effort weight.
+    w_safety : float
+        Adaptive multiplier (updated online) for the soft safety shaping accumulator.
+    w_margin : float
+        Weight for the soft barrier against safety margin violation.
+    safety_scale : float
+        Reserved knob (kept for compatibility); can be used to scale the safety term.
+    """
     w_terminal: float = 10.0
     w_intermediate: float = 1.0
     w_control: float = 0.001
 
+    # soft-safety shaping
+    w_safety: float = 10.0
+    w_margin: float = 10.0
+    safety_scale: float = 0.2
+
 
 # =============================================================================
-# Functional CP-MPC Controller (FUNCTIONAL CP VERSION, HARD FILTER ONLY)
+# Functional CP-MPC Controller
 # =============================================================================
 
 class FunctionalCPMPC:
     """
-    Functional CP-informed Monte Carlo MPC controller (hard filtering only).
+    Functional CP-informed Monte Carlo MPC controller.
 
-    FunctionalCPParams encodes residual field basis:
-        S_i(x) = S_mean(x) + coeffs[i] @ phi_basis[:, x]
-        U_i(x) = rhos[i] * max(S_i(x), eps)
+    Summary of the online logic:
+      1) Sample candidate control sequences.
+      2) Roll out unicycle dynamics to generate candidate paths.
+      3) Filter infeasible paths using:
+           - static obstacle collision checks, and
+           - CP-conformalized distance lower bound to predicted dynamic obstacles.
+      4) Score the remaining feasible paths with an MPC objective
+         (goal tracking + control effort + optional soft safety shaping),
+         and select the first control of the best plan.
 
-    Safety filtering uses:
-        d_lower = max(d_nom - U_i(x), 0)
-        keep path if d_lower >= safe_rad for all steps along the horizon
+    Key idea:
+      - Offline, you precompute (per horizon index i) a parameterized upper envelope U_i(x)
+        for the residual field, and cache its parameters.
+      - Online, you only evaluate U_i(x) at the finite set of rollout states.
     """
+
+    # ---------------------------------------------------------------------
+    # Constructor
+    # ---------------------------------------------------------------------
 
     def __init__(
         self,
         *,
-        cp_params: FunctionalCPParams,
+        cp_params: List[Any],
         box: float,
         world_center: np.ndarray,
         grid_H: int,
@@ -69,12 +102,43 @@ class FunctionalCPMPC:
         n_paths: int,
         seed: int = 0,
         weights: Optional[FuncMPCWeights] = None,
-        eps_S: float = 1e-9,
+        risk_level: float = 0.8,
+        step_size: float = 10.,
+        CP: bool = True,
     ):
+        """
+        Parameters
+        ----------
+        cp_params : list
+            Offline-cached parameters for the CP envelope, one per horizon index i.
+            Each element is expected to have a field `t_idx` used as a dictionary key.
+        box, world_center, grid_H, grid_W
+            Workspace grid configuration used for fast basis lookup:
+              - world -> grid index -> basis vector phi(x).
+        n_steps, dt, n_skip
+            MPC horizon length, timestep, and control blocking factor.
+        robot_rad, obstacle_rad
+            Used to define the safety radius r_safe = robot_rad + obstacle_rad.
+        min_linear_x, max_linear_x, min_angular_z, max_angular_z
+            Sampling bounds for candidate controls.
+        n_paths
+            Number of Monte Carlo candidate paths per MPC call.
+        seed
+            RNG seed for reproducibility.
+        weights
+            MPC objective weights. If None, defaults are used.
+        risk_level
+            Target slack level used by the adaptive safety-weight update.
+        step_size
+            Step size for the adaptive update of w_safety.
+        """
         # Workspace/grid configuration
         self.box = float(box)
         self.world_center = np.asarray(world_center, dtype=np.float32)
         self.grid_H, self.grid_W = int(grid_H), int(grid_W)
+
+        # Cache CP parameters by horizon index i ("time-to-go")
+        self.params: Dict[int, CPStepParameters] = {int(p.t_idx): p for p in cp_params}
 
         # MPC rollout configuration
         self.n_steps = int(n_steps)
@@ -94,59 +158,25 @@ class FunctionalCPMPC:
         self.n_paths = int(n_paths)
         self.rng = np.random.default_rng(int(seed))
         self.weights = weights or FuncMPCWeights()
-        self.last_best_vels: Optional[np.ndarray] = None
+        self.last_best_vels: Optional[np.ndarray] = None  # warm-start storage
 
-        # Functional CP params
-        self.cp_params = cp_params
-        self.eps_S = float(eps_S)
-
-        # Sanity checks / alignment
-        if int(self.cp_params.grid_shape[0]) != self.grid_H or int(self.cp_params.grid_shape[1]) != self.grid_W:
-            raise ValueError(
-                f"cp_params.grid_shape={self.cp_params.grid_shape} "
-                f"but controller grid={(self.grid_H, self.grid_W)}"
-            )
-        if int(self.cp_params.rhos.shape[0]) != self.n_steps:
-            raise ValueError(f"cp_params.rhos has H={self.cp_params.rhos.shape[0]} but n_steps={self.n_steps}")
-        if int(self.cp_params.coeffs.shape[0]) != self.n_steps:
-            raise ValueError(f"cp_params.coeffs has H={self.cp_params.coeffs.shape[0]} but n_steps={self.n_steps}")
-
-        # Flattened grid size D
-        self.D = int(self.grid_H * self.grid_W)
-
-        # S_mean is expected flattened (D,)
-        self.S_mean = np.asarray(self.cp_params.S_mean, dtype=np.float32).reshape(-1)
-        if self.S_mean.shape[0] != self.D:
-            raise ValueError(f"cp_params.S_mean has D={self.S_mean.shape[0]} but expected {self.D}")
-
-        # coeffs: (H, r)
-        self.coeffs = np.asarray(self.cp_params.coeffs, dtype=np.float32)
-        # phi_basis: (r, D) (recommended) OR (D, r) (we accept and transpose)
-        self.phi = np.asarray(self.cp_params.phi_basis, dtype=np.float32)
-
-        if self.phi.ndim != 2:
-            raise ValueError("cp_params.phi_basis must be 2D")
-
-        r = int(self.coeffs.shape[1])
-        if self.phi.shape == (r, self.D):
-            pass
-        elif self.phi.shape == (self.D, r):
-            self.phi = self.phi.T  # -> (r, D)
-        else:
-            raise ValueError(
-                f"phi_basis shape mismatch. Expected (r,D)=({r},{self.D}) or (D,r)=({self.D},{r}), got {self.phi.shape}"
-            )
-
-        self.rhos = np.asarray(self.cp_params.rhos, dtype=np.float32).reshape(self.n_steps,)
-
-        # Simulation timestep counter
-        self.step_count = 0
+        # Adaptive soft-safety tuning (simple feedback controller)
+        self._target_slack = float(risk_level)
+        self._eta = float(step_size)
+        self.CP = CP
 
     # ---------------------------------------------------------------------
     # Grid geometry helpers (world <-> grid)
     # ---------------------------------------------------------------------
 
     def _world_to_grid_ij(self, pos_world: np.ndarray) -> Optional[Tuple[int, int]]:
+        """
+        Map a world coordinate (x,y) to the nearest grid index (i,j).
+
+        The grid represents coordinates in:
+          rel = pos_world - world_center
+          rel_x, rel_y in [-box/2, box/2].
+        """
         rel = np.asarray(pos_world, dtype=np.float32) - self.world_center
         u = (rel[0] + self.box / 2.0) / self.box * (self.grid_W - 1)
         v = (rel[1] + self.box / 2.0) / self.box * (self.grid_H - 1)
@@ -159,35 +189,90 @@ class FunctionalCPMPC:
         return (i, j)
 
     def _grid_flat_index(self, ij: Tuple[int, int]) -> int:
+        """Flatten (i,j) index into [0, H*W)."""
         i, j = ij
         return i * self.grid_W + j
 
     # ---------------------------------------------------------------------
-    # Functional CP evaluation: U_i(x)
+    # Adaptive update helper
+    # ---------------------------------------------------------------------
+
+    def _update_w_safety_from_slack(
+        self,
+        min_slack: float,
+        *,
+        target_slack: float,
+        w_min: float = 1e-2,
+        w_max: float = 1e4,
+    ) -> float:
+
+        if not np.isfinite(min_slack):
+            return float(self.weights.w_safety)
+
+        # -----------------------------
+        # 1. instantaneous target weight
+        # -----------------------------
+        raw_w = self._eta * (max(target_slack - float(min_slack), 0.0)) ** 2
+
+        if min_slack > 1.5 * target_slack:
+            raw_w = w_min
+            self._eta += 0.1
+
+        raw_w = float(np.clip(raw_w, w_min, w_max))
+
+        # -----------------------------
+        # 2. smoothing using n_steps
+        # -----------------------------
+        # effective smoothing horizon ≈ n_steps
+        alpha = 1.0 / max(self.n_steps, 1)   # or 2/(n_steps+1)
+
+        w_prev = float(self.weights.w_safety)
+        w_new = (1.0 - alpha) * w_prev + alpha * raw_w
+
+        w_new = float(np.clip(w_new, w_min, w_max))
+        self.weights.w_safety = w_new
+
+        return w_new
+
+    # ---------------------------------------------------------------------
+    # Functional CP envelope evaluation: U_i(x)
     # ---------------------------------------------------------------------
 
     def evaluate_U(self, pos_world: np.ndarray, t_idx: int) -> float:
         """
-        U_i(x) = rho_i * max( S_i(x), eps )
-        S_i(x) = S_mean(x) + coeffs[i] @ phi_basis[:, x]
+        Evaluate the cached upper envelope U_i(x) at a world position x.
+
+        Expected parameterization in CPStepParameters:
+          - phi_basis: shape (p_eff, H*W)   (basis evaluated on grid)
+          - mus:       shape (K, p_eff)     (ellipsoid centers in coefficient space)
+          - sigmas:    shape (K, p_eff, p_eff)
+          - rks:       shape (K,)           (ellipsoid radii)
+          - epsilon:   scalar               (projection slack)
         """
-        idx = int(t_idx)
-        if not (0 <= idx < self.n_steps):
+        p = self.params.get(int(t_idx))
+        if p is None:
+            # If no cached envelope for that horizon index, return a conservative fallback.
             return 1.0
 
         ij = self._world_to_grid_ij(pos_world)
         if ij is None:
+            # Outside the grid: return conservative fallback.
             return 1.0
 
-        flat = self._grid_flat_index(ij)  # in [0, D)
-        # S_mean(x)
-        s = float(self.S_mean[flat])
-        # + coeffs[i] @ phi[:, flat]
-        # (r,) dot (r,)
-        s += float(np.dot(self.coeffs[idx], self.phi[:, flat]))
-        s = max(s, self.eps_S)
+        idx = self._grid_flat_index(ij)
 
-        return float(self.rhos[idx] * s)
+        # Basis vector phi(x) from cached grid basis
+        phi_x = p.phi_basis[:, idx].astype(np.float32, copy=False)  # (p_eff,)
+
+        # centers[k] = <mu_k, phi(x)>
+        centers = p.mus @ phi_x  # (K,)
+
+        # quads[k] = phi(x)^T Sigma_k phi(x)
+        quads = np.einsum("i,kij,j->k", phi_x, p.sigmas, phi_x)  # (K,)
+
+        # Support function over union of ellipsoids (take max across components)
+        upper_k = centers + p.rks * np.sqrt(np.maximum(quads, 0.0))
+        return float(p.epsilon + np.max(upper_k))
 
     # ---------------------------------------------------------------------
     # Public MPC API
@@ -204,15 +289,38 @@ class FunctionalCPMPC:
         *,
         obst_pred_traj: Optional[np.ndarray] = None,  # (H, M, 2) or (H,2)
         obst_mask: Optional[np.ndarray] = None,       # (H, M) or (H,)
-        current_obs: Optional[np.ndarray] = None,     # kept only for external collision stats; not used here
     ):
+        """
+        Compute the control action [v, w] for the current state.
+
+        Inputs
+        ------
+        pos_x, pos_y, orientation_z
+            Current robot pose.
+        goal
+            Goal position as (2,) array-like in world coordinates.
+        boxes
+            Optional list of static obstacle boxes with fields: pos, w, h, rad.
+        predictions
+            Optional dict-format dynamic predictions:
+              {agent_id: np.ndarray(T_pred, 2)}.
+
+        Alternative input format (trajectory + mask)
+        -------------------------------------------
+        obst_pred_traj:
+            Array with shape (H, M, 2) (or (H,2) for single obstacle).
+        obst_mask:
+            Visibility mask with shape (H, M) (or (H,) for single).
+            Invisible steps are treated as "far away" and thus ignored.
+        """
         if goal is None:
             raise ValueError("goal must be provided.")
         goal = np.asarray(goal, dtype=np.float32)
 
-        # Normalize dynamic predictions if obst_pred_traj provided
+        # Normalize dynamic predictions into dict format if obst_pred_traj was provided.
         if obst_pred_traj is not None:
             predictions = self._normalize_predictions(obst_pred_traj, obst_mask)
+
         if predictions is None:
             predictions = {}
 
@@ -220,12 +328,12 @@ class FunctionalCPMPC:
 
         t0 = time.perf_counter()
 
-        # 1) Sample candidate controls and roll out
+        # 1) Sample candidate controls and roll out dynamics
         t_roll0 = time.perf_counter()
         paths, vels = self.generate_paths_random(pos_x, pos_y, orientation_z)
         t_roll1 = time.perf_counter()
 
-        # 2) Filter infeasible (hard)
+        # 2) Hard feasibility filtering (static obstacles + CP-safe distance checks)
         t_filt0 = time.perf_counter()
         safe_paths, safe_vels, cp_violation = self.filter_unsafe_paths(paths, vels, boxes, predictions)
         t_filt1 = time.perf_counter()
@@ -249,18 +357,22 @@ class FunctionalCPMPC:
                 "counts": stats,
             }
 
-        # 3) Score feasible candidates (goal+effort only)
+        # 3) Score feasible candidates and pick the best
         t_score0 = time.perf_counter()
-        best_idx, best_cost = self.score_paths(safe_paths, safe_vels, goal)
+        best_idx, best_cost, best_min_slack = self.score_paths(safe_paths, safe_vels, goal, predictions)
+        self._update_w_safety_from_slack(
+            best_min_slack,
+            target_slack=self._target_slack,
+        )
         self.last_best_vels = safe_vels[best_idx].copy()
         t_score1 = time.perf_counter()
 
+        # Apply the first control in the best plan
         act = np.asarray(safe_vels[best_idx, 0], dtype=np.float32)
-        best_path = safe_paths[best_idx]
 
         info = {
             "feasible": True,
-            "final_path": best_path,
+            "final_path": safe_paths[best_idx],
             "cost": float(best_cost),
             "timing": {
                 "total_ms": (time.perf_counter() - t0) * 1000.0,
@@ -269,9 +381,8 @@ class FunctionalCPMPC:
                 "score_ms": (t_score1 - t_score0) * 1000.0,
             },
             "counts": stats,
+            "safety_weight": float(self.weights.w_safety),
         }
-
-        self.step_count += 1
         return act, info
 
     # ---------------------------------------------------------------------
@@ -283,8 +394,15 @@ class FunctionalCPMPC:
         obst_pred_traj: np.ndarray,
         obst_mask: Optional[np.ndarray],
     ) -> Dict[int, np.ndarray]:
+        """
+        Convert (H, M, 2) (+ mask) predictions into dict format:
+          {m: (H,2)} in world coordinates.
+
+        Invisible steps are set to a very large value so they do not constrain distances.
+        """
         pred_arr = np.asarray(obst_pred_traj, dtype=np.float32)
 
+        # Allow (H,2) for single obstacle
         if pred_arr.ndim == 2 and pred_arr.shape[-1] == 2:
             pred_arr = pred_arr[:, None, :]
 
@@ -307,7 +425,7 @@ class FunctionalCPMPC:
             traj_m = pred_arr[:, m, :].copy()
             invis = ~mask[:, m]
             if np.any(invis):
-                traj_m[invis] = 1e9
+                traj_m[invis] = 1e9  # effectively removes obstacle at those steps
             pred_dict[m] = traj_m
 
         return pred_dict
@@ -323,13 +441,26 @@ class FunctionalCPMPC:
         boxes: List[Any],
         predictions: Dict[Any, np.ndarray],
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float]:
+        """
+        Hard feasibility filtering.
+
+        A candidate path is rejected if:
+          (A) It collides with any static box obstacle (expanded by robot radius), OR
+          (B) It violates dynamic safety when compared against:
+                d_lower(x) = max(d_nom(x) - U_i(x), 0).
+
+        Notes
+        -----
+        - This stage is intentionally strict: it defines the feasible set.
+        - Soft safety shaping (used in scoring) is only for ranking within feasible candidates.
+        """
         P, T1, _ = paths.shape
         T = T1 - 1
 
         boxes = boxes or []
         predictions = predictions or {}
 
-        # (A) Static obstacles (same as before)
+        # (A) Static obstacles: OBB collision check in obstacle local frame
         mask_static_unsafe = np.zeros(P, dtype=bool)
         if len(boxes) > 0:
             for box in boxes:
@@ -340,38 +471,55 @@ class FunctionalCPMPC:
                 c, s = np.cos(th), np.sin(th)
                 R = np.array([[c, -s], [s, c]], dtype=np.float32)
 
+                # Expand box by robot radius (Minkowski sum approximation for axis-aligned bounds in local frame)
                 lb = -0.5 * sz - self.robot_rad
                 ub = 0.5 * sz + self.robot_rad
 
+                # Transform candidate points into obstacle local coordinates
                 transformed = (paths[:, 1:, :] - center) @ R  # (P, T, 2)
-                coll = np.any(np.all((transformed >= lb) & (transformed <= ub), axis=-1), axis=-1)
+
+                coll = np.any(
+                    np.all((transformed >= lb) & (transformed <= ub), axis=-1),
+                    axis=-1,
+                )
                 mask_static_unsafe |= coll
 
-        # (B) Dynamic obstacles with Functional CP envelope (hard)
+        # (B) Dynamic obstacles: CP-conformalized distance lower bound checks
         mask_dynamic_unsafe = np.zeros(P, dtype=bool)
-        cp_violation = 0.0
+        cp_violation = 0.0  # (reserved: you can accumulate margin violations here if desired)
 
         if len(predictions) > 0:
             pred_list = list(predictions.values())
             pred_arr = np.asarray(pred_list, dtype=np.float32)  # (M, T_pred, 2)
             if pred_arr.ndim != 3:
-                raise ValueError("predictions must be dict of (T_pred,2).")
+                raise ValueError("predictions must be a dict of arrays shaped (T_pred, 2).")
             pred_arr = pred_arr.transpose(1, 0, 2)  # (T_pred, M, 2)
 
             T_use = min(T, pred_arr.shape[0])
 
             for i in range(P):
+                # Early exit once unsafe
                 for t in range(T_use):
-                    x = paths[i, t + 1]
-                    d_nom = float(np.min(np.linalg.norm(x[None, :] - pred_arr[t], axis=1)))
-                    U = self.evaluate_U(x, t)
-                    d_lower = max(d_nom - U, 0.0)
+                    x = paths[i, t + 1]  # position at step t
 
+                    # Nominal distance to predicted obstacles
+                    d_nom = float(np.min(np.linalg.norm(x[None, :] - pred_arr[t], axis=1)))
+
+                    # Spatial uncertainty envelope at horizon t
+                    d_lower = d_nom
+                    if self.CP:
+                        U = self.evaluate_U(x, t)
+
+                    # Conformalized lower bound distance (nonnegative)
+                        d_lower = max(d_nom - U, 0.0)
+
+                    # Conservative filtering near the first few steps
                     if d_lower < self.safe_rad:
                         mask_dynamic_unsafe[i] = True
-                        break  # early exit for this path
+                        break
 
         mask_safe = ~(mask_static_unsafe | mask_dynamic_unsafe)
+        mask_safe = ~ mask_static_unsafe
 
         if np.any(mask_safe):
             return paths[mask_safe], vels[mask_safe], float(cp_violation)
@@ -379,7 +527,7 @@ class FunctionalCPMPC:
         return None, None, float(cp_violation)
 
     # ---------------------------------------------------------------------
-    # Candidate generation
+    # Candidate generation (Monte Carlo control sampling)
     # ---------------------------------------------------------------------
 
     def generate_paths_random(
@@ -388,25 +536,37 @@ class FunctionalCPMPC:
         pos_y: float,
         orientation_z: float,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Sample random piecewise-constant control sequences and roll out unicycle dynamics.
+
+        Implementation details:
+          - Control blocking: every `n_skip` steps share the same (v, w).
+          - Warm start: if last_best_vels exists, reuse it (shifted) as the first candidate.
+        """
         n_steps = int(self.n_steps)
         n_skip = int(self.n_skip)
         if n_steps <= 0:
             raise ValueError(f"n_steps must be >= 1, got {n_steps}")
 
+        # Number of control epochs after blocking
         n_epochs = int(math.ceil(n_steps / max(1, n_skip)))
 
+        # Sample epoch-wise controls
         v_epoch = self.rng.uniform(self.min_v, self.max_v, size=(self.n_paths, n_epochs)).astype(np.float32)
         w_epoch = self.rng.uniform(self.min_w, self.max_w, size=(self.n_paths, n_epochs)).astype(np.float32)
 
+        # Warm start (first candidate)
         if self.last_best_vels is not None and self.last_best_vels.shape[0] >= 2:
             v_warm = np.append(self.last_best_vels[1:, 0], self.rng.uniform(self.min_v, self.max_v))
             w_warm = np.append(self.last_best_vels[1:, 1], self.rng.uniform(self.min_w, self.max_w))
             v_epoch[0, :] = v_warm[:n_epochs]
             w_epoch[0, :] = w_warm[:n_epochs]
 
-        v = np.repeat(v_epoch, n_skip, axis=1)[:, :n_steps]
-        w = np.repeat(w_epoch, n_skip, axis=1)[:, :n_steps]
+        # Expand to per-step controls and truncate to horizon length
+        v = np.repeat(v_epoch, n_skip, axis=1)[:, :n_steps]  # (P, n_steps)
+        w = np.repeat(w_epoch, n_skip, axis=1)[:, :n_steps]  # (P, n_steps)
 
+        # Roll out positions
         paths = np.zeros((self.n_paths, n_steps + 1, 2), dtype=np.float32)
         paths[:, 0, 0] = float(pos_x)
         paths[:, 0, 1] = float(pos_y)
@@ -419,11 +579,71 @@ class FunctionalCPMPC:
             paths[:, t + 1, 1] = paths[:, t, 1] + dt * v[:, t] * np.sin(th)
             th = th + dt * w[:, t]
 
-        vels = np.stack([v, w], axis=-1).astype(np.float32)
+        vels = np.stack([v, w], axis=-1).astype(np.float32)  # (P, n_steps, 2)
+        return paths, vels
+    
+    def generate_paths_guided(self, pos_x, pos_y, orientation_z):
+        n_steps = self.n_steps
+        n_skip = self.n_skip
+        n_epochs = int(math.ceil(n_steps / max(1, n_skip)))
+        
+        # 1. 샘플 비중 결정 (계산량은 n_paths로 동일)
+        n_explo = int(self.n_paths * 0.7)
+        n_explor = self.n_paths - n_explo
+
+        # 2. Exploration: 기존처럼 무작위 샘플링 (30%)
+        v_explor = self.rng.uniform(self.min_v, self.max_v, size=(n_explor, n_epochs))
+        w_explor = self.rng.uniform(self.min_w, self.max_w, size=(n_explor, n_epochs))
+
+        # 3. Exploitation: 이전 최적해 주변 샘플링 (70%)
+        if self.last_best_vels is not None:
+            # 이전 제어 입력을 다음 스텝으로 시프트 (워름스타트)
+            prev_v = np.append(self.last_best_vels[1:, 0], self.last_best_vels[-1, 0])[:n_epochs]
+            prev_w = np.append(self.last_best_vels[1:, 1], self.last_best_vels[-1, 1])[:n_epochs]
+            
+            # 가우시안 노이즈 추가 (표준편차는 제어 범위의 약 10% 정도로 설정)
+            v_explo = self.rng.normal(loc=prev_v, scale=(self.max_v - self.min_v)*0.1, size=(n_explo, n_epochs))
+            w_explo = self.rng.normal(loc=prev_w, scale=(self.max_w - self.min_w)*0.1, size=(n_explo, n_epochs))
+            
+            # 제어 범위 제한 (Clip)
+            v_explo = np.clip(v_explo, self.min_v, self.max_v)
+            w_explo = np.clip(w_explo, self.min_w, self.max_w)
+            
+            v_epoch = np.vstack([v_explo, v_explor])
+            w_epoch = np.vstack([w_explo, w_explor])
+        else:
+            v_epoch = self.rng.uniform(self.min_v, self.max_v, size=(self.n_paths, n_epochs))
+            w_epoch = self.rng.uniform(self.min_w, self.max_w, size=(self.n_paths, n_epochs))
+
+                # Warm start (first candidate)
+        if self.last_best_vels is not None and self.last_best_vels.shape[0] >= 2:
+            v_warm = np.append(self.last_best_vels[1:, 0], self.rng.uniform(self.min_v, self.max_v))
+            w_warm = np.append(self.last_best_vels[1:, 1], self.rng.uniform(self.min_w, self.max_w))
+            v_epoch[0, :] = v_warm[:n_epochs]
+            w_epoch[0, :] = w_warm[:n_epochs]
+
+        # Expand to per-step controls and truncate to horizon length
+        v = np.repeat(v_epoch, n_skip, axis=1)[:, :n_steps]  # (P, n_steps)
+        w = np.repeat(w_epoch, n_skip, axis=1)[:, :n_steps]  # (P, n_steps)
+
+        # Roll out positions
+        paths = np.zeros((self.n_paths, n_steps + 1, 2), dtype=np.float32)
+        paths[:, 0, 0] = float(pos_x)
+        paths[:, 0, 1] = float(pos_y)
+
+        th = np.full((self.n_paths,), float(orientation_z), dtype=np.float32)
+        dt = float(self.dt)
+
+        for t in range(n_steps):
+            paths[:, t + 1, 0] = paths[:, t, 0] + dt * v[:, t] * np.cos(th)
+            paths[:, t + 1, 1] = paths[:, t, 1] + dt * v[:, t] * np.sin(th)
+            th = th + dt * w[:, t]
+
+        vels = np.stack([v, w], axis=-1).astype(np.float32)  # (P, n_steps, 2)
         return paths, vels
 
     # ---------------------------------------------------------------------
-    # Scoring (goal + control only)
+    # Scoring (MPC objective over feasible paths)
     # ---------------------------------------------------------------------
 
     def score_paths(
@@ -431,12 +651,111 @@ class FunctionalCPMPC:
         paths: np.ndarray,                # (P, T+1, 2)
         vels: np.ndarray,                 # (P, T, 2)
         goal: np.ndarray,                 # (2,)
-    ) -> Tuple[int, float]:
+        predictions: Dict[Any, np.ndarray],
+    ) -> Tuple[int, float, float]:
+        """
+        Score feasible candidate paths.
+
+        Base costs (standard MPC):
+          - intermediate goal tracking,
+          - terminal goal tracking,
+          - control effort.
+
+        Optional soft safety shaping (only if predictions exist):
+          - penalize safety margin violations using a smooth barrier on (safe_rad - d_lower),
+          - include an urgency weight to emphasize earlier steps,
+          - compute a "soft minimum slack" summary used to adapt w_safety online.
+
+        Returns
+        -------
+        best_idx : int
+            Index of the minimum-cost path.
+        best_cost : float
+            Minimum total cost value.
+        best_min_slack : float
+            Slack-like scalar for the selected path (used for adaptive tuning).
+        """
+        P, T1, _ = paths.shape
+        T = T1 - 1
+
+        # Standard MPC terms
         intermediate = self.weights.w_intermediate * np.sum((paths[:, :-1, :] - goal) ** 2, axis=(-2, -1))
         terminal = self.weights.w_terminal * np.sum((paths[:, -1, :] - goal) ** 2, axis=-1)
         control = self.weights.w_control * np.sum(vels ** 2, axis=(-2, -1))
         total_cost = intermediate + terminal + control
 
+        # Slack summary used for adaptation (smoothed "min slack" proxy)
+        tau = 0.2
+        softmin_acc = np.zeros(P, dtype=np.float32)
+        softmin = np.full(P, np.inf, dtype=np.float32)
+
+        # Soft safety shaping
+        if self.weights.w_safety > 0.0 and predictions and len(predictions) > 0:
+            pred_arr = np.asarray(list(predictions.values()), dtype=np.float32).transpose(1, 0, 2)  # (T_pred, M, 2)
+            T_use = min(T, pred_arr.shape[0])
+
+            safety_acc = np.zeros(P, dtype=np.float32)
+            prev_d_lower: Optional[np.ndarray] = None
+
+            # Soft barrier parameters
+            sigma = 0.2  # smoothness for softplus
+
+            for t in range(T_use):
+                x_t = paths[:, t + 1, :]  # (P,2)
+
+                # Nominal distance to nearest predicted agent at step t
+                diff = x_t[:, None, :] - pred_arr[t][None, :, :]
+                d_nom = np.min(np.linalg.norm(diff, axis=-1), axis=1)  # (P,)
+
+                # Envelope evaluation U_i(x) for each candidate state at this time step.
+                # NOTE: this loop is often fine because P is moderate (Monte Carlo),
+                # and evaluate_U is lightweight (grid lookup + matvec).
+
+                d_lower = d_nom
+
+                if self.CP:
+                    U_vec = np.array([self.evaluate_U(x_t[i], t) for i in range(P)], dtype=np.float32)
+                    
+                
+                # Conformalized lower bound distance
+                    d_lower = np.maximum(d_nom - U_vec, 0.0)
+
+                # Smooth barrier against violating the safety radius
+                violation = self.safe_rad - d_lower  # positive => inside safety margin
+                phi = np.log1p(np.exp(violation / sigma))  # softplus
+
+                # Emphasize earlier steps (you can invert this if you want stronger long-horizon caution)
+                urgency_weight = max(0.0, 1.0 - t / max(1, T_use))
+
+                penalty = self.weights.w_margin * phi  # (P,)
+
+                # Optional "progress bonus": reduce cost when d_lower increases over time
+                # (encourages moving toward safer regions along the horizon)
+                if prev_d_lower is not None:
+                    delta = d_lower - prev_d_lower
+                    gain = np.maximum(delta, 0.0)
+                    gain = np.minimum(gain, 0.5)  # cap
+                    penalty = penalty - self._eta * gain
+
+                prev_d_lower = d_lower
+
+                safety_acc += urgency_weight * penalty
+
+                # Slack summary accumulation (only early steps)
+                # slack_t > 0 means satisfying a tightened margin (safe_rad + target_slack)
+                slack_t = d_lower - (self.safe_rad + self._target_slack)
+                w_t = np.exp(-t / 0.9)  # heavier weight near t=0
+                softmin_acc += w_t * np.exp(-slack_t / tau)
+
+            # Add soft safety shaping to cost
+            total_cost = total_cost + self.weights.w_safety * (safety_acc / max(1, T_use))
+
+            # Convert accumulator into a "soft minimum slack" proxy:
+            # larger acc => more negative slack somewhere => larger penalty.
+            softmin = -tau * np.log(softmin_acc + 1e-12)
+
         best_idx = int(np.argmin(total_cost))
         best_cost = float(total_cost[best_idx])
-        return best_idx, best_cost
+        best_min_slack = float(softmin[best_idx])
+
+        return best_idx, best_cost, best_min_slack

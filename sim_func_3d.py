@@ -30,8 +30,8 @@ DT = 0.4
 ROBOT_RAD = 0.4
 OBSTACLE_RAD = 1.0 / np.sqrt(2.0)
 
-MAX_LINEAR_X = 0.8
-MIN_LINEAR_X = -0.8
+MAX_LINEAR_X = 2.0
+MIN_LINEAR_X = -2.0
 MAX_ANGULAR_Z = 0.7
 MIN_ANGULAR_Z = -0.7
 VZ_MIN, VZ_MAX = -0.3, 0.3
@@ -412,7 +412,6 @@ def run_one_episode_visual_3d(
             D_true = distance_field_points_3d(gt_i_vis, X, Y, Z)
             true_unsafe = (D_true < safe_rad)
 
-        # ✅ containment evaluated *each step* when GT exists
         containment_ok = None
         voxel_recall = None
         if true_unsafe is not None:
@@ -589,11 +588,22 @@ def run_one_episode_visual_3d(
 
 if __name__ == "__main__":
     env = QuadWorldEnv3D(
-        dt=DT,
+        dt=0.4,
         horizon=12,
-        n_obs=30,
+        n_obs=600,
         world_bounds_xyz=((-5, 15), (-5, 15), (0.0, 20.0)),
         seed=0,
+
+        pred_model_noise=0.10,
+
+        obs_process_noise=0.12,
+        gt_future_noise=0.10,
+
+        mode_switch_p=0.8,
+        mode_min_ttl=2,
+        mode_max_ttl=10,
+        turn_rate_std=2.0,
+        stop_go_p=0.9,
     )
 
     run_one_episode_visual_3d(

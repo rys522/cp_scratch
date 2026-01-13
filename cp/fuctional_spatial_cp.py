@@ -19,12 +19,11 @@ class FunctionalCPConfig:
     backend: str = "loky"
 
     modulation: str = "sqrt"   # {"sqrt","sup"}
-    score: str = "sup"         # {"sup","sqrt"}
+    score: str = "sqrt"         # {"sup","sqrt"}
 
     s_eps: float = 1e-6
     one_sided_positive: bool = True
 
-    # ✅ basis compression options
     use_shared_basis: bool = True      # S_i를 공통 basis로 압축할지
     p_base: int = 16                   # basis dimension (공통 basis 크기)
 
@@ -47,6 +46,7 @@ class FunctionalCP:
         self._N: Optional[int] = None
         self._T: Optional[int] = None
         self._grid_shape: Optional[Tuple[int, ...]] = None
+
 
     def fit(self, residuals: np.ndarray) -> None:
         if residuals.ndim not in (3, 4, 5):
@@ -107,9 +107,6 @@ class FunctionalCP:
         k = int(np.clip(k, 0, n - 1))
         return float(x_sorted[k])
 
-    # ------------------------------------------------------
-    # ✅ 논문 Algorithm 1: (X_star, S, rho) 추출 (t_idx별)
-    # ------------------------------------------------------
     def _extract_single(self, t_idx: int) -> Tuple[np.ndarray, np.ndarray, float]:
         Y, _shape = self._get_flat_view(t_idx)  # (N, D)
         D = Y.shape[1]
@@ -153,9 +150,6 @@ class FunctionalCP:
 
         return x_star, S, float(rho)
 
-    # ------------------------------------------------------
-    # ✅ 전체 파라미터 추출 + (선택) 공통 basis로 압축
-    # ------------------------------------------------------
     def extract_params_all(self) -> FunctionalCPParams:
         self._assert_fitted()
         T = self._T
