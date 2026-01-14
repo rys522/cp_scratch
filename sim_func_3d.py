@@ -26,14 +26,14 @@ from cp.fuctional_spatial_cp import (
 from controllers.func_3d_mpc import FunctionalCPMPC3D
 
 
-DT = 0.4
+DT = 0.15
 ROBOT_RAD = 0.4
 OBSTACLE_RAD = 1.0 / np.sqrt(2.0)
 
-MAX_LINEAR_X = 2.0
+MAX_LINEAR_X = 7.0
 MIN_LINEAR_X = -2.0
-MAX_ANGULAR_Z = 0.7
-MIN_ANGULAR_Z = -0.7
+MAX_ANGULAR_Z = 1.2
+MIN_ANGULAR_Z = -1.2
 VZ_MIN, VZ_MAX = -0.3, 0.3
 
 
@@ -594,22 +594,22 @@ if __name__ == "__main__":
         world_bounds_xyz=((-5, 15), (-5, 15), (0.0, 20.0)),
         seed=0,
 
-        pred_model_noise=0.10,
+        pred_model_noise=0.35,
 
         obs_process_noise=0.12,
         gt_future_noise=0.10,
 
-        mode_switch_p=0.8,
-        mode_min_ttl=2,
-        mode_max_ttl=10,
-        turn_rate_std=2.0,
-        stop_go_p=0.9,
+        mode_switch_p=0.98,
+        mode_min_ttl=1,
+        mode_max_ttl=5,
+        turn_rate_std=4.0,
+        stop_go_p=0.6,
     )
 
     run_one_episode_visual_3d(
         env,
         nx=40, ny=40, nz=40,
-        time_horizon=12,
+        time_horizon=20,
         alpha=0.10,
         test_size=0.30,
         random_state=0,

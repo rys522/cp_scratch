@@ -618,11 +618,11 @@ def run_one_episode_visual_from_file(
 
 
 if __name__ == "__main__":
-    DATASET = "eth"
+    DATASET = "univ"
     run_one_episode_visual_from_file(
         dataset=DATASET,
         scenario_idx=0,
-        time_horizon=17,
+        time_horizon=12,
         grid_H=128,
         grid_W=128,
         alpha=0.1,
