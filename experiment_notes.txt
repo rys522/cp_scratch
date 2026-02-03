@@ -1,0 +1,308 @@
+1. Drone setting
+
+ROBOT_RAD = 0.4
+OBSTACLE_RAD = 1.0 / np.sqrt(2.0)
+
+MAX_LINEAR_VEL = 6.0 
+MAX_ANGULAR_Z = 0.7
+MIN_ANGULAR_Z = -0.7
+
+MAX_VZ = 1.5
+
+    env = QuadWorldEnv3D(
+        dt=0.1,
+        horizon=20,
+        n_obs=125,
+        world_bounds_xyz=((-5, 15), (-5, 15), (0.0, 20.0)),
+        seed=0,
+
+        pred_model_noise=0.20,
+
+        obs_process_noise=0.22,
+        gt_future_noise=0.20,
+
+        mode_switch_p=0.8,
+        mode_min_ttl=1,
+        mode_max_ttl=6,
+        turn_rate_std=3.0,
+        stop_go_p=0.6,
+    )
+
+    run_one_episode_visual_3d(
+        env,
+        nx=40, ny=40, nz=40,
+        time_horizon=12,
+        alpha=0.10,
+        p_base=6,
+        k_mix=7,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=max(1, (os.cpu_count() or 4) - 2),
+        backend="loky",
+        n_skip=4,
+        n_paths=2000,
+        max_steps=250,
+        i_view=3,
+        n_calib_samples=120,
+        goal_finish_dist=0.8,
+        mc_stride=2,
+        view_elev=22.0,
+        view_azim=-55.0,
+        dpi=140,
+        CP=False,
+    )
+
+    without CP : 120 collisions, 206 infeasibility
+    with CP : 0 collisions, 65 infeasibility 160 step
+
+
+
+    if __name__ == "__main__":
+    env = QuadWorldEnv3D(
+        dt=0.1,
+        horizon=20,
+        n_obs=140,
+        world_bounds_xyz=((-5, 15), (-5, 15), (0.0, 20.0)),
+        seed=2,
+
+        pred_model_noise=0.20,
+
+        obs_process_noise=0.22,
+        gt_future_noise=0.20,
+
+        mode_switch_p=0.95,
+        mode_min_ttl=1,
+        mode_max_ttl=6,
+        turn_rate_std=3.0,
+        stop_go_p=0.6,
+        gui = False
+    )
+
+    run_one_episode_visual_3d(
+        env,
+        nx=40, ny=40, nz=40,
+        time_horizon=12,
+        alpha=0.10,
+        p_base=6,
+        k_mix=7,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=max(1, (os.cpu_count() or 4) - 2),
+        backend="loky",
+        n_skip=4,
+        n_paths=2000,
+        max_steps=250,
+        i_view=3,
+        n_calib_samples=120,
+        goal_finish_dist=0.8,
+        mc_stride=2,
+        view_elev=22.0,
+        view_azim=-55.0,
+        dpi=140,
+        CP=False,
+    )
+
+
+    without CP: 120 collisions, 206 infeasibility
+    with CP: 0 collisions, 0 infeasibility, 97 step
+
+
+
+    ROBOT_RAD = 0.1
+OBSTACLE_RAD = 0.2
+
+MAX_LINEAR_VEL = 3.0 
+MAX_ANGULAR_Z = 0.7
+MIN_ANGULAR_Z = -0.7
+
+MAX_VZ = 0.7
+
+
+    env = QuadWorldEnv3D(
+        dt=0.1,
+        horizon=20,
+        n_obs=300,
+        world_bounds_xyz=((-3, 7), (-3, 7), (0.0, 8.0)),
+        seed=2,
+
+        pred_model_noise=0.20,
+
+        obs_process_noise=0.22,
+        gt_future_noise=0.20,
+
+        mode_switch_p=0.95,
+        mode_min_ttl=1,
+        mode_max_ttl=6,
+        turn_rate_std=3.0,
+        stop_go_p=0.6,
+        gui = False
+    )
+
+    run_one_episode_visual_3d(
+        env,
+        nx=40, ny=40, nz=40,
+        time_horizon=12,
+        alpha=0.10,
+        p_base=8,
+        k_mix=10,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=max(1, (os.cpu_count() or 4) - 2),
+        backend="loky",
+        n_skip=4,
+        n_paths=2000,
+        max_steps=250,
+        i_view=3,
+        n_calib_samples=120,
+        goal_finish_dist=0.25,
+        mc_stride=2,
+        view_elev=22.0,
+        view_azim=-55.0,
+        dpi=140,
+        CP = False,
+    )
+
+    without CP: 0 collisions, 0 infeasibility but crashed
+    with CP: 0 collisions, 5 infeasibility, 138 step
+
+    env = QuadWorldEnv3D(
+        dt=0.1,
+        horizon=20,
+        n_obs=280,
+        world_bounds_xyz=((-3, 7), (-3, 7), (0.0, 8.0)),
+        seed=2,
+
+        pred_model_noise=0.20,
+
+        obs_process_noise=0.22,
+        gt_future_noise=0.20,
+
+        mode_switch_p=0.95,
+        mode_min_ttl=1,
+        mode_max_ttl=6,
+        turn_rate_std=3.0,
+        stop_go_p=0.6,
+        gui = False
+    )
+
+    run_one_episode_visual_3d(
+        env,
+        nx=40, ny=40, nz=40,
+        time_horizon=12,
+        alpha=0.10,
+        p_base=8,
+        k_mix=10,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=max(1, (os.cpu_count() or 4) - 2),
+        backend="loky",
+        n_skip=4,
+        n_paths=2000,
+        max_steps=250,
+        i_view=3,
+        n_calib_samples=120,
+        goal_finish_dist=0.3,
+        mc_stride=2,
+        view_elev=22.0,
+        view_azim=-55.0,
+        dpi=140,
+        CP = False,
+    )
+
+    without CP: 31 collisions, 45 infeasibility reached goal by 0.3 seed2
+
+    0 collisions, 223 infeasibility 250 step seed 5
+
+    ==== Online compute timing (ms) ====
+    [timing] controller (FunctionalCPMPC3D): mean=8.088 ms | p50=1.214 | p90=16.662 | p99=88.420 | max=91.656
+    [timing] env.step (physics): mean=28.555 ms | p50=28.562 | p90=28.789 | p99=29.083 | max=29.508
+    [timing] total loop: mean=36.901 ms | p50=29.991 | p90=45.769 | p99=117.423 | max=121.528
+
+    with Functional CP: 
+    
+    0 collisions, 21 infeasibility, 119 step seed 2
+    ==== Online compute timing (ms) ====
+    [timing] controller (FunctionalCPMPC3D): mean=47.839 ms | p50=51.102 | p90=61.166 | p99=65.276 | max=66.038
+    [timing] env.step (physics): mean=28.963 ms | p50=28.900 | p90=29.360 | p99=31.182 | max=32.062
+    [timing] total loop: mean=77.001 ms | p50=80.287 | p90=90.391 | p99=94.696 | max=95.881
+    ===================================
+
+    with CC MPC: 0 collisions, 0 infeasibility but did not make it
+    ==== Online compute timing (ms) ====
+    [timing] controller: mean=20.035 ms | p50=19.229 | p90=23.195 | p99=25.111 | max=54.892
+    [timing] env.step (physics): mean=29.541 ms | p50=28.832 | p90=30.670 | p99=36.418 | max=81.512
+    [timing] total loop: mean=49.782 ms | p50=48.444 | p90=53.886 | p99=59.429 | max=136.630
+    ===================================
+
+    with ECP MPC: 0 collisions, 0 infeasibility but crashed (failed to real-time control)
+    ==== Online compute timing (ms) ====
+    [timing] controller: mean=242.253 ms | p50=259.780 | p90=261.468 | p99=276.638 | max=286.802
+    [timing] env.step (physics): mean=2.727 ms | p50=2.736 | p90=2.841 | p99=3.007 | max=3.160
+    [timing] total loop: mean=263.241 ms | p50=281.187 | p90=283.148 | p99=298.610 | max=308.810
+    ===================================
+    
+
+2. MPC in ETH/ UCY dataset
+    1) soft constraint offline only CP
+    run_one_episode_visual_from_file(
+        dataset=DATASET,
+        scenario_idx=0,
+        time_horizon=17,
+        grid_H=128,
+        grid_W=128,
+        alpha=0.1,
+        p_base=6,
+        k_mix=7,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=max(1, (os.cpu_count() or 4) - 2),
+        backend="loky",
+        n_skip=2,
+        n_paths=1200,
+        max_tracking_error=0.05,
+    )
+
+    univ dataset
+
+ with CP: GOAL reached | timestep=94 | Cov=100.00% | dist=0.57 | infeasible=0 | collisions=15 | colision_rate=0.19 | infeas_rate=0.00
+ without CP: GOAL reached | timestep=108 | Cov=100.00% | dist=0.45 | infeasible=0 | collisions=27 | colision_rate=0.29 | infeas_rate=0.00
+
+    zara1 dataset
+
+with CP: Failed | timestep=99 | Cov=100.00% | dist_goal=2.41 | infeasible=0 | collisions=9 | colision_rate=0.09 | infeas_rate=0.00 
+without CP: GOAL reached | timestep=58 | Cov=100.00% | dist=0.46 | infeasible=0 | collisions=3 | colision_rate=0.07 | infeas_rate=0.00
+
+    zara2 dataset
+
+with CP: GOAL reached | timestep=84 | Cov=100.00% | dist=0.56 | infeasible=0 | collisions=16 | colision_rate=0.23 | infeas_rate=0.00
+without CP: GOAL reached | timestep=77 | Cov=100.00% | dist=0.50 | infeasible=0 | collisions=23 | colision_rate=0.37 | infeas_rate=0.00
+
+    eth dataset
+
+with CP: GOAL reached | timestep=61 | Cov=100.00% | dist=0.40 | infeasible=0 | collisions=1 | colision_rate=0.02 | infeas_rate=0.00
+without CP: GOAL reached | timestep=51 | Cov=100.00% | dist=0.46 | infeasible=0 | collisions=1 | colision_rate=0.03 | infeas_rate=0.00
+
+
+ 2) hard constraint offline only CP
+
+ if __name__ == "__main__":
+    DATASET = "univ"
+    run_one_episode_visual_from_file(
+        dataset=DATASET,
+        scenario_idx=0,
+        time_horizon=12,
+        grid_H=128,
+        grid_W=128,
+        alpha=0.1,
+        p_base=6,
+        k_mix=7,
+        test_size=0.30,
+        random_state=0,
+        n_jobs=max(1, (os.cpu_count() or 4) - 2),
+        backend="loky",
+        n_skip=2,
+        n_paths=1200,
+        max_tracking_error=0.05,
+        CP = True,
+    )
+

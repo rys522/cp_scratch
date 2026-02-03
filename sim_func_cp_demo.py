@@ -498,7 +498,7 @@ def run_one_episode_visual_from_file(
         p_now = get_current_obs_from_history(h_dict)
 
         # Choose which future step to visualize/compare
-        i_view = 5 # 0 means t+1 in reference convention
+        i_view = 0 # 0 means t+1 in reference convention
 
         p_future = get_future_obs_from_future_dict(f_dict, i_view)
 
@@ -622,7 +622,7 @@ if __name__ == "__main__":
     run_one_episode_visual_from_file(
         dataset=DATASET,
         scenario_idx=0,
-        time_horizon=12,
+        time_horizon=17,
         grid_H=128,
         grid_W=128,
         alpha=0.1,

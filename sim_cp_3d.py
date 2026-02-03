@@ -1,30 +1,32 @@
 from __future__ import annotations
 
+import os
 import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 from quad_env import QuadWorldEnv3D
-from controllers.ecp_mpc_3d import EgocentricCPMPC3D, MPC3DWeights
+from controllers.cp_3d_mpc import ConformalController3D
 
-
-DT = 0.4
+# ----------------------------
+# Constants
+# ----------------------------
 ROBOT_RAD = 0.1
 OBSTACLE_RAD = 0.2
 
-MAX_LINEAR_VEL = 3.0 
+MAX_LINEAR_VEL = 3.0
+MAX_VZ = 0.7
 MAX_ANGULAR_Z = 0.7
 MIN_ANGULAR_Z = -0.7
 
-MAX_VZ = 0.7
 
 # ----------------------------
-# Helpers (same style as your simple code)
+# Helpers
 # ----------------------------
-def stack_pred3d_from_p_dict(p_dict: dict[int, np.ndarray], horizon: int):
+def stack_pred3d_from_p_dict(p_dict: Dict[int, np.ndarray], horizon: int):
     pids = list(p_dict.keys())
     M = len(pids)
     Hh = int(horizon)
@@ -70,67 +72,45 @@ def _get_obs_positions_from_history(obs_dict) -> np.ndarray:
     h_dict = obs_dict.get("history", {})
     if not h_dict:
         return np.zeros((0, 3), dtype=np.float32)
-    # last point of each obstacle trajectory
-    return np.asarray([np.asarray(traj, dtype=np.float32)[-1] for traj in h_dict.values()], dtype=np.float32)
+    return np.asarray([traj[-1] for traj in h_dict.values()], dtype=np.float32)
 
 
 # ----------------------------
-# Main (ECP version: record -> playback)
+# Main
 # ----------------------------
-def run_one_episode_ecp_3d_simple(
+def run_one_episode_visual_3d_simple(
     env: QuadWorldEnv3D,
     *,
-    # controller params
     time_horizon: int = 12,
     n_skip: int = 4,
-    robot_rad: float = 0.1,
-    obstacle_rad: float = 0.2,
-    v_lim: Tuple[float, float] = (-3.0, 3.0),
-    vz_lim: Tuple[float, float] = (-0.7, 0.7),
-    yaw_rate_lim: Tuple[float, float] = (-0.7, 0.7),
-    v_points: Tuple[float, ...] = (-1.0, 0.0, 1.0),
-    w_points: Tuple[float, ...] = (-1.0, 0.0, 1.0),
-    vz_points: Tuple[float, ...] = (-1.0, 0.0, 1.0),
-    calibration_set_size: int = 15,
-    miscoverage_level: float = 0.10,
-    step_size: float = 0.05,
-    weights: Optional[MPC3DWeights] = None,
-    # sim params
     max_steps: int = 250,
-    warmup_steps: int = 0,
-    goal_finish_dist: float = 0.8,
-    # viz params
+    goal_finish_dist: float = 0.3,
     view_elev: float = 22.0,
     view_azim: float = -55.0,
     dpi: int = 140,
     save: bool = False,
-    save_path: str = "quad_ecp_3d_simple.mp4",
+    save_path: str = "quad_cc_3d_simple.mp4",
 ):
-    if weights is None:
-        weights = MPC3DWeights(w_terminal=10.0, w_intermediate=1.0, w_control=0.001)
-
     # ----------------------------
     # Controller
     # ----------------------------
-    ctrl = EgocentricCPMPC3D(
-        n_steps=int(time_horizon),
-        dt=float(env.dt),
-        n_skip=int(n_skip),
-        robot_rad=float(robot_rad),
-        obstacle_rad=float(obstacle_rad),
-        v_lim=tuple(map(float, v_lim)),
-        vz_lim=tuple(map(float, vz_lim)),
-        yaw_rate_lim=tuple(map(float, yaw_rate_lim)),
-        v_points=tuple(map(float, v_points)),
-        w_points=tuple(map(float, w_points)),
-        vz_points=tuple(map(float, vz_points)),
-        calibration_set_size=int(calibration_set_size),
-        miscoverage_level=float(miscoverage_level),
-        step_size=float(step_size),
-        weights=weights,
+    ctrl = ConformalController3D(
+        n_steps=time_horizon,
+        dt=env.dt,
+        n_skip=n_skip,
+        v_xy_lim=(-MAX_LINEAR_VEL, MAX_LINEAR_VEL),
+        vz_lim=(-MAX_VZ, MAX_VZ),
+        yaw_rate_lim=(MIN_ANGULAR_Z, MAX_ANGULAR_Z),
+        robot_rad=ROBOT_RAD,
+        obstacle_rad=OBSTACLE_RAD,
+        w_terminal=10.0,
+        w_intermediate=1.0,
+        w_control=0.001,
+        use_dynamic=True,
+
     )
 
-    # world walls (same as your simple code)
+    # simple wall boxes
     xlim, ylim, zlim = env.xlim, env.ylim, env.zlim
     margin = 5.0
     cov_min, cov_max = -50.0, 50.0
@@ -150,46 +130,24 @@ def run_one_episode_ecp_3d_simple(
     # Record Phase
     # ----------------------------
     obs = env.reset()
-    goal = np.asarray(obs.get("goal_xyz", obs.get("goal_xyz", [0, 0, 0])), dtype=np.float32).reshape(3,)
+    goal = np.asarray(obs.get("goal_xyz", [0, 0, 0]), dtype=np.float32).reshape(3,)
 
-    episode_history: List[Dict] = []
+    episode_history = []
     timing = {"ctrl_ms": [], "step_ms": [], "loop_ms": []}
 
-    safe_rad = float(robot_rad + obstacle_rad)
-
-    collisions = 0
-    infeasible = 0
-
-    # keep last command format like env.step expects
     vx_global, vy_global, vz_global, yaw_rate = 0.0, 0.0, 0.0, 0.0
 
-    for k in range(int(max_steps)):
+    for k in range(max_steps):
         t_loop0 = time.perf_counter()
 
         robot = np.asarray(obs["robot_xyz"], dtype=np.float32).reshape(3,)
         yaw = float(obs["robot_yaw"])
-        robot_vel = np.asarray(obs.get("robot_vel", np.zeros(3, dtype=np.float32)), dtype=np.float32).reshape(3,)
 
-        dist_goal = float(np.linalg.norm(robot - goal))
-        if dist_goal <= float(goal_finish_dist):
-            print(f"Goal reached at step {k} (dist_goal={dist_goal:.3f})")
+        if np.linalg.norm(robot - goal) <= goal_finish_dist:
+            print(f"Goal reached at step {k}")
             break
 
-        # collision check (current step)
-        obs_now = _get_obs_positions_from_history(obs)
-        if obs_now.size:
-            dmin_now = float(np.min(np.linalg.norm(obs_now - robot[None, :], axis=1)))
-        else:
-            dmin_now = float("inf")
-        if dmin_now < safe_rad:
-            collisions += 1
-
-        # Update obs/history into controller (ECP uses history internally)
-        _ = ctrl.update_observations(obs.get("history", {}))
-
-        # Predictions
-        p_dict = obs.get("prediction", {})
-        pred_xyz, pred_mask, _ = stack_pred3d_from_p_dict(p_dict, horizon=ctrl.n_steps)
+        pred, pred_mask, _ = stack_pred3d_from_p_dict(obs.get("prediction", {}), horizon=time_horizon)
 
         # ---- controller timing ----
         t0 = time.perf_counter()
@@ -197,38 +155,25 @@ def run_one_episode_ecp_3d_simple(
             robot_xyz=robot,
             robot_yaw=yaw,
             goal_xyz=goal,
-            pred_xyz=pred_xyz,
+            pred_xyz=pred,
             pred_mask=pred_mask,
             boxes_3d=wall_boxes,
-            robot_vel=robot_vel,
         )
+
         t1 = time.perf_counter()
 
-        # Important: ECP sometimes updates prediction cache separately
-        ctrl.update_predictions(p_dict)
+        feasible = bool(info.get("feasible", False)) and (act is not None)
 
-        feasible = bool(info.get("feasible", False)) if isinstance(info, dict) else (act is not None)
-        feasible = feasible and (act is not None)
-
-        # Warmup behavior
-        if k < int(warmup_steps):
-            feasible = True
+        if not feasible:
             target_pos = robot.copy()
-            target_vel = np.zeros((4,), dtype=np.float32)
-            act_to_store = (target_pos.copy(), target_vel.copy())
+            vx_global, vy_global, vz_global, yaw_rate = 0.0, 0.0, 0.0, 0.0
+            act_to_store = None
         else:
-            if not feasible:
-                infeasible += 1
-                target_pos = robot.copy()
-                target_vel = np.zeros((4,), dtype=np.float32)
-                act_to_store = None
-            else:
-                target_pos, target_vel = act
-                target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3,)
-                target_vel = np.asarray(target_vel, dtype=np.float32).reshape(4,)
-                act_to_store = (target_pos.copy(), target_vel.copy())
-
-        vx_global, vy_global, vz_global, yaw_rate = map(float, target_vel)
+            target_pos, target_vel = act
+            target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3,)
+            target_vel = np.asarray(target_vel, dtype=np.float32).reshape(4,)
+            vx_global, vy_global, vz_global, yaw_rate = map(float, target_vel)
+            act_to_store = (target_pos.copy(), target_vel.copy())
 
         # ---- env.step timing ----
         t2 = time.perf_counter()
@@ -246,14 +191,9 @@ def run_one_episode_ecp_3d_simple(
             {
                 "step": k,
                 "obs": _deepcopy_obs_dict(obs),
-                "robot": robot.copy(),  # state *before* step
-                "robot_vel": robot_vel.copy(),
+                "robot": robot,
                 "act": act_to_store,
-                "feasible": bool(feasible),
-                "dist_goal": dist_goal,
-                "dmin_now": dmin_now,
-                "collisions_so_far": int(collisions),
-                "infeasible_so_far": int(infeasible),
+                "feasible": feasible,
                 "timing": {"ctrl_ms": ctrl_ms, "step_ms": step_ms, "loop_ms": loop_ms},
             }
         )
@@ -276,21 +216,19 @@ def run_one_episode_ecp_3d_simple(
     _summ(timing["step_ms"], "env.step (physics)")
     _summ(timing["loop_ms"], "total loop")
     print("===================================\n")
+
     print(f"Simulation finished. Total frames: {total_frames}. Starting Visualization...")
 
-    if total_frames == 0:
-        return {"traj": np.zeros((0, 3), dtype=np.float32), "collisions": collisions, "infeasible": infeasible}
-
     # ----------------------------
-    # Visualization (playback)
+    # Visualization
     # ----------------------------
-    fig = plt.figure(figsize=(10, 8), dpi=int(dpi))
+    fig = plt.figure(figsize=(10, 8), dpi=dpi)
     ax3d = fig.add_subplot(111, projection="3d")
 
     ax3d.set_xlabel("x")
     ax3d.set_ylabel("y")
     ax3d.set_zlabel("z")
-    ax3d.view_init(elev=float(view_elev), azim=float(view_azim))
+    ax3d.view_init(elev=view_elev, azim=view_azim)
     _set_equal_aspect_3d(ax3d, xlim, ylim, zlim)
     ax3d.grid(False)
 
@@ -298,9 +236,14 @@ def run_one_episode_ecp_3d_simple(
     ax3d.scatter([goal[0]], [goal[1]], [goal[2]], marker="*", s=160, edgecolors="k", linewidths=0.4)
 
     # artists
-    (robot_dot,) = ax3d.plot([], [], [], marker="o", markersize=8, linewidth=0)
-    (robot_line,) = ax3d.plot([], [], [], linewidth=2.5, alpha=0.9)
+    robot_dot, = ax3d.plot([], [], [], marker="o", markersize=8, linewidth=0)
+    robot_line, = ax3d.plot([], [], [], linewidth=2.5, alpha=0.9)
     obs_sc = ax3d.scatter([], [], [], s=18, alpha=0.8)
+
+    robot_traj: List[np.ndarray] = []
+
+    safe_rad = ROBOT_RAD + OBSTACLE_RAD
+    collision_count = 0
 
     info_txt = ax3d.text2D(
         0.02, 0.98, "",
@@ -310,11 +253,8 @@ def run_one_episode_ecp_3d_simple(
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.6"),
     )
 
-    robot_traj: List[np.ndarray] = []
-    collision_count_playback = 0  # count during playback (same definition)
-
     def upd(k: int):
-        nonlocal collision_count_playback
+        nonlocal collision_count
 
         if k >= total_frames:
             return []
@@ -326,14 +266,17 @@ def run_one_episode_ecp_3d_simple(
         robot_traj.append(robot.copy())
         tr = np.asarray(robot_traj, dtype=np.float32)
 
-        obs_now = _get_obs_positions_from_history(obs_k)
+        obs_now = _get_obs_positions_from_history(obs_k)  # (N,3)
+
+        # ---- collision count (for reporting only) ----
         if obs_now.size:
             dmin_now = float(np.min(np.linalg.norm(obs_now - robot[None, :], axis=1)))
         else:
             dmin_now = float("inf")
         if dmin_now < safe_rad:
-            collision_count_playback += 1
+            collision_count += 1
 
+        # ---- action (cmd) ----
         act = data.get("act", None)
         if act is None:
             pos_cmd = robot
@@ -343,43 +286,40 @@ def run_one_episode_ecp_3d_simple(
             pos_cmd = np.asarray(pos_cmd, dtype=np.float32).reshape(3,)
             vel_cmd = np.asarray(vel_cmd, dtype=np.float32).reshape(4,)
 
-        robot_vel = np.asarray(data.get("robot_vel", [0, 0, 0]), dtype=np.float32).reshape(3,)
+        robot_vel = np.asarray(obs_k.get("robot_vel", [0, 0, 0]), dtype=np.float32).reshape(3,)
         dist_goal = float(np.linalg.norm(robot - goal))
 
         tinfo = data["timing"]
-        ctrl_ms = float(tinfo["ctrl_ms"])
-        step_ms = float(tinfo["step_ms"])
-        loop_ms = float(tinfo["loop_ms"])
+        ctrl_ms = tinfo["ctrl_ms"]
+        step_ms = tinfo["step_ms"]
+        loop_ms = tinfo["loop_ms"]
 
         # update artists
         robot_dot.set_data([robot[0]], [robot[1]])
         robot_dot.set_3d_properties([robot[2]])
-
         robot_line.set_data(tr[:, 0], tr[:, 1])
         robot_line.set_3d_properties(tr[:, 2])
-
         obs_sc._offsets3d = (obs_now[:, 0], obs_now[:, 1], obs_now[:, 2]) if obs_now.size else ([], [], [])
 
-        ax3d.set_title(f"ECP-3D (record/playback) | step={k} | feasible={data['feasible']}", fontsize=11)
+        ax3d.set_title(f"step={k} | feasible={data['feasible']}", fontsize=11)
 
         info_txt.set_text(
             "\n".join([
                 f"step: {k}/{total_frames-1}",
                 f"feasible: {data['feasible']}",
                 f"dist_goal: {dist_goal:.3f} (finish<= {goal_finish_dist})",
-                f"warmup: {warmup_steps} steps",
                 "",
                 f"pos_cmd: ({pos_cmd[0]:.2f}, {pos_cmd[1]:.2f}, {pos_cmd[2]:.2f})",
                 f"vel_cmd: (vx={vel_cmd[0]:.2f}, vy={vel_cmd[1]:.2f}, vz={vel_cmd[2]:.2f}, yaw_rate={vel_cmd[3]:.2f})",
                 f"robot_pos: ({robot[0]:.2f}, {robot[1]:.2f}, {robot[2]:.2f})",
                 f"robot_vel: (vx={robot_vel[0]:.2f}, vy={robot_vel[1]:.2f}, vz={robot_vel[2]:.2f})",
                 "",
-                f"collisions: {collision_count_playback} (dmin_now={dmin_now:.3f}, r_safe={safe_rad:.3f})",
-                f"infeasible_count(record): {data['infeasible_so_far']}",
+                f"collisions: {collision_count} (dmin_now={dmin_now:.3f}, r_safe={safe_rad:.3f})",
                 "",
                 f"timing(ms): ctrl={ctrl_ms:.2f} | step={step_ms:.2f} | loop={loop_ms:.2f}",
             ])
         )
+
         return []
 
     anim = FuncAnimation(fig, upd, frames=total_frames, interval=80, blit=False, repeat=False)
@@ -397,17 +337,13 @@ def run_one_episode_ecp_3d_simple(
 
     plt.show()
 
-    # return record summary
-    traj_arr = np.asarray([h["robot"] for h in episode_history], dtype=np.float32)
-    return {"traj": traj_arr, "collisions": int(collisions), "infeasible": int(infeasible)}
-
 
 if __name__ == "__main__":
     env = QuadWorldEnv3D(
         dt=0.1,
         horizon=20,
-        n_obs=2,
-        world_bounds_xyz=((-3.0, 7.0), (-3.0, 7.0), (0.0, 8.0)),
+        n_obs=280,
+        world_bounds_xyz=((-3, 7), (-3, 7), (0.0, 8.0)),
         seed=2,
         pred_model_noise=0.20,
         obs_process_noise=0.22,
@@ -420,19 +356,15 @@ if __name__ == "__main__":
         gui=False,
     )
 
-    weights = MPC3DWeights(w_terminal=10.0, w_intermediate=1.0, w_control=0.001)
-
-    run_one_episode_ecp_3d_simple(
+    run_one_episode_visual_3d_simple(
         env,
         time_horizon=12,
         n_skip=4,
         max_steps=250,
-        warmup_steps=15,
         goal_finish_dist=0.3,
         view_elev=22.0,
         view_azim=-55.0,
         dpi=140,
         save=False,
-        save_path="quad_ecp_3d_simple.mp4",
-        weights=weights,
+        save_path="quad_cc_3d_simple.mp4",
     )
