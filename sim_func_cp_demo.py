@@ -17,7 +17,7 @@ from sims.sim_utils import (
 from cp.functional_cp import get_envelopes_value_and_function, CPStepParameters
 from controllers.func_cp_mpc import FunctionalCPMPC
 from controllers.func_cp_potential import FunctionalCPFieldController
-
+import time
 
 # ==============================================================================
 # 0) Constants (aligned to your main runner)
@@ -318,6 +318,19 @@ def get_future_obs_from_future_dict(f_dict: Dict, i_view: int) -> np.ndarray:
     return np.asarray(pts, dtype=np.float32) if len(pts) > 0 else np.zeros((0, 2), dtype=np.float32)
 
 
+def _timing_stats_ms(arr: List[float]) -> Dict[str, float]:
+    if len(arr) == 0:
+        return {"mean": float("nan"), "p50": float("nan"), "p90": float("nan"), "p99": float("nan"), "max": float("nan")}
+    a = np.asarray(arr, dtype=np.float64)
+    return {
+        "mean": float(np.mean(a)),
+        "p50": float(np.percentile(a, 50)),
+        "p90": float(np.percentile(a, 90)),
+        "p99": float(np.percentile(a, 99)),
+        "max": float(np.max(a)),
+    }
+
+
 # ==============================================================================
 # 5) One-episode visualization (file-based) with AUTO world/grid
 # ==============================================================================
@@ -422,6 +435,7 @@ def run_one_episode_visual_from_file(
     robot_traj = [robot_xy.copy()]
     collision_count = 0
     infeasible_count = 0
+    ctrl_times_ms: List[float] = []  # store per-step controller call time (ms)
 
     # timestep-wise global coverage: 1{ true_unsafe ⊆ cp_unsafe } averaged over t
     eval_steps = 0
@@ -476,6 +490,12 @@ def run_one_episode_visual_from_file(
                 f"Ended | timestep={k} | Cov={current_cov_val:.2%} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
             )
             print(f"Ended | timestep={k} | Cov={current_cov_val:.2%} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}")
+            stats = _timing_stats_ms(ctrl_times_ms)
+            print(
+                f"[timing] controller: "
+                f"mean={stats['mean']:.3f} ms | p50={stats['p50']:.3f} | "
+                f"p90={stats['p90']:.3f} | p99={stats['p99']:.3f} | max={stats['max']:.3f}"
+            )
             status_text.set_color("red")
             anim.event_source.stop()
             return []
@@ -486,6 +506,12 @@ def run_one_episode_visual_from_file(
                 f"GOAL reached | timestep={k} | Cov={current_cov_val:.2%} | dist={dist_to_goal:.2f} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}"
             )
             print(f"GOAL reached | timestep={k} | Cov={current_cov_val:.2%} | dist={dist_to_goal:.2f} | infeasible={infeasible_count} | collisions={collision_count} | colision_rate={collision_count / max(1, k-14):.2f} | infeas_rate={infeasible_count / max(1, k-14):.2f}")
+            stats = _timing_stats_ms(ctrl_times_ms)
+            print(
+                f"[timing] controller: "
+                f"mean={stats['mean']:.3f} ms | p50={stats['p50']:.3f} | "
+                f"p90={stats['p90']:.3f} | p99={stats['p99']:.3f} | max={stats['max']:.3f}"
+            )
             status_text.set_color("green")
             anim.event_source.stop()
             return []
@@ -550,6 +576,7 @@ def run_one_episode_visual_from_file(
             current_cov_val = 0.0
 
         # Control uses full horizon pred (still reference-aligned)
+        t0 = time.perf_counter()
         act, info = ctrl(
             pos_x=float(robot_xy[0]),
             pos_y=float(robot_xy[1]),
@@ -559,6 +586,9 @@ def run_one_episode_visual_from_file(
             obst_mask=obst_mask,
             goal=goal,
         )
+        t1 = time.perf_counter()
+        ctrl_times_ms.append((t1 - t0) * 1000.0)
+
         safety_weight = info.get("safety_weight", 0.0)
         feasible = bool(info.get("feasible", False))
         if not feasible:
@@ -604,6 +634,8 @@ def run_one_episode_visual_from_file(
             f"collisions={collision_count} | infeasible={infeasible_count} | "
             f"dist_goal={float(np.linalg.norm(robot_xy - goal)):.2f}"
         )
+
+
         status_text.set_color("red" if (is_coll or not feasible) else "black")
 
         # Update robot

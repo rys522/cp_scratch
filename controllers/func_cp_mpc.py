@@ -273,6 +273,51 @@ class FunctionalCPMPC:
         # Support function over union of ellipsoids (take max across components)
         upper_k = centers + p.rks * np.sqrt(np.maximum(quads, 0.0))
         return float(p.epsilon + np.max(upper_k))
+    
+
+    def evaluate_U_batch(self, pos_world: np.ndarray, t_idx: int) -> np.ndarray:
+        """
+        pos_world: (P,2)
+        returns: (P,) U_i(x)
+        """
+        p = self.params.get(int(t_idx))
+        if p is None:
+            return np.ones((pos_world.shape[0],), dtype=np.float32)
+
+        X = np.asarray(pos_world, dtype=np.float32)
+        Pn = X.shape[0]
+
+        # world -> grid (vectorized)
+        rel = X - self.world_center[None, :]
+        u = (rel[:, 0] + self.box / 2.0) / self.box * (self.grid_W - 1)
+        v = (rel[:, 1] + self.box / 2.0) / self.box * (self.grid_H - 1)
+
+        inside = (u >= 0.0) & (u <= (self.grid_W - 1)) & (v >= 0.0) & (v <= (self.grid_H - 1))
+
+        # fallback outside
+        out = np.ones((Pn,), dtype=np.float32)
+        if not np.any(inside):
+            return out
+
+        j = np.rint(u[inside]).astype(np.int32)
+        i = np.rint(v[inside]).astype(np.int32)
+        idx = (i * self.grid_W + j).astype(np.int32)  # (Pin,)
+
+        # gather phi(x): p_eff x Pin
+        phi = p.phi_basis[:, idx].astype(np.float32, copy=False)  # (p_eff, Pin)
+
+        # centers: (K, p_eff) @ (p_eff, Pin) -> (K, Pin)
+        centers = (p.mus @ phi).astype(np.float32, copy=False)
+
+        # quads: for each k and each point: phi^T Sigma_k phi
+        # einsum: (p,Pin), (K,p,p), (p,Pin) -> (K,Pin)
+        quads = np.einsum("ip,kij,jp->kp", phi, p.sigmas, phi).astype(np.float32, copy=False)
+
+        upper = centers + p.rks[:, None].astype(np.float32) * np.sqrt(np.maximum(quads, 0.0))
+        Ui = (p.epsilon + np.max(upper, axis=0)).astype(np.float32)  # (Pin,)
+
+        out[inside] = Ui
+        return out
 
     # ---------------------------------------------------------------------
     # Public MPC API
@@ -497,29 +542,33 @@ class FunctionalCPMPC:
 
             T_use = min(T, pred_arr.shape[0])
 
-            for i in range(P):
-                # Early exit once unsafe
-                for t in range(T_use):
-                    x = paths[i, t + 1]  # position at step t
+            # Track which paths are still "alive" (not yet marked unsafe)
+            alive = ~mask_dynamic_unsafe  # (P,)
 
-                    # Nominal distance to predicted obstacles
-                    d_nom = float(np.min(np.linalg.norm(x[None, :] - pred_arr[t], axis=1)))
+            for t in range(T_use):
+                if not np.any(alive):
+                    break
 
-                    # Spatial uncertainty envelope at horizon t
-                    d_lower = d_nom
-                    if self.CP:
-                        U = self.evaluate_U(x, t)
+                x_t = paths[alive, t + 1, :]               # (Palive, 2)
+                obs_t = pred_arr[t]                        # (M, 2)
 
-                    # Conformalized lower bound distance (nonnegative)
-                        d_lower = max(d_nom - U, 0.0)
+                # d_nom for all alive paths: min_m ||x - obs||
+                diff = x_t[:, None, :] - obs_t[None, :, :] # (Palive, M, 2)
+                d_nom = np.min(np.linalg.norm(diff, axis=-1), axis=1)  # (Palive,)
 
-                    # Conservative filtering near the first few steps
-                    if d_lower < self.safe_rad:
-                        mask_dynamic_unsafe[i] = True
-                        break
+                d_lower = d_nom
+                if self.CP:
+                    U_vec = self.evaluate_U_batch(x_t, t)  # (Palive,)
+                    d_lower = np.maximum(d_nom - U_vec, 0.0)
 
-        mask_safe = ~(mask_static_unsafe | mask_dynamic_unsafe)
-        mask_safe = ~ mask_static_unsafe
+                hit = d_lower < self.safe_rad              # (Palive,)
+                if np.any(hit):
+                    idx_alive = np.flatnonzero(alive)      # indices in [0,P)
+                    mask_dynamic_unsafe[idx_alive[hit]] = True
+                    alive[idx_alive[hit]] = False
+
+                mask_safe = ~(mask_static_unsafe | mask_dynamic_unsafe)
+                mask_safe = ~ mask_static_unsafe
 
         if np.any(mask_safe):
             return paths[mask_safe], vels[mask_safe], float(cp_violation)
@@ -647,43 +696,27 @@ class FunctionalCPMPC:
         goal: np.ndarray,                 # (2,)
         predictions: Dict[Any, np.ndarray],
     ) -> Tuple[int, float, float]:
-        """
-        Score feasible candidate paths.
-
-        Base costs (standard MPC):
-          - intermediate goal tracking,
-          - terminal goal tracking,
-          - control effort.
-
-        Optional soft safety shaping (only if predictions exist):
-          - penalize safety margin violations using a smooth barrier on (safe_rad - d_lower),
-          - include an urgency weight to emphasize earlier steps,
-          - compute a "soft minimum slack" summary used to adapt w_safety online.
-
-        Returns
-        -------
-        best_idx : int
-            Index of the minimum-cost path.
-        best_cost : float
-            Minimum total cost value.
-        best_min_slack : float
-            Slack-like scalar for the selected path (used for adaptive tuning).
-        """
         P, T1, _ = paths.shape
         T = T1 - 1
 
+        # -----------------------------
         # Standard MPC terms
+        # -----------------------------
         intermediate = self.weights.w_intermediate * np.sum((paths[:, :-1, :] - goal) ** 2, axis=(-2, -1))
         terminal = self.weights.w_terminal * np.sum((paths[:, -1, :] - goal) ** 2, axis=-1)
         control = self.weights.w_control * np.sum(vels ** 2, axis=(-2, -1))
         total_cost = intermediate + terminal + control
 
-        # Slack summary used for adaptation (smoothed "min slack" proxy)
+        # -----------------------------
+        # Slack summary used for adaptation
+        # -----------------------------
         tau = 0.2
         softmin_acc = np.zeros(P, dtype=np.float32)
         softmin = np.full(P, np.inf, dtype=np.float32)
 
+        # -----------------------------
         # Soft safety shaping
+        # -----------------------------
         if self.weights.w_safety > 0.0 and predictions and len(predictions) > 0:
             pred_arr = np.asarray(list(predictions.values()), dtype=np.float32).transpose(1, 0, 2)  # (T_pred, M, 2)
             T_use = min(T, pred_arr.shape[0])
@@ -691,61 +724,44 @@ class FunctionalCPMPC:
             safety_acc = np.zeros(P, dtype=np.float32)
             prev_d_lower: Optional[np.ndarray] = None
 
-            # Soft barrier parameters
             sigma = 0.2  # smoothness for softplus
 
             for t in range(T_use):
                 x_t = paths[:, t + 1, :]  # (P,2)
 
                 # Nominal distance to nearest predicted agent at step t
-                diff = x_t[:, None, :] - pred_arr[t][None, :, :]
-                d_nom = np.min(np.linalg.norm(diff, axis=-1), axis=1)  # (P,)
+                diff = x_t[:, None, :] - pred_arr[t][None, :, :]          # (P, M, 2)
+                d_nom = np.min(np.linalg.norm(diff, axis=-1), axis=1)      # (P,)
 
-                # Envelope evaluation U_i(x) for each candidate state at this time step.
-                # NOTE: this loop is often fine because P is moderate (Monte Carlo),
-                # and evaluate_U is lightweight (grid lookup + matvec).
-
-                d_lower = d_nom
-
-                if self.CP:
-                    U_vec = np.array([self.evaluate_U(x_t[i], t) for i in range(P)], dtype=np.float32)
-                    
-                
                 # Conformalized lower bound distance
-                    d_lower = np.maximum(d_nom - U_vec, 0.0)
+                if self.CP:
+                    U_vec = self.evaluate_U_batch(x_t, t).astype(np.float32, copy=False)  # (P,)
+                    d_lower = np.maximum(d_nom - U_vec, 0.0).astype(np.float32, copy=False)
+                else:
+                    d_lower = d_nom.astype(np.float32, copy=False)
 
                 # Smooth barrier against violating the safety radius
-                violation = self.safe_rad - d_lower  # positive => inside safety margin
-                phi = np.log1p(np.exp(violation / sigma))  # softplus
+                violation = (self.safe_rad - d_lower) / sigma  # (P,)
+                phi = np.log1p(np.exp(violation)).astype(np.float32, copy=False)  # softplus
 
-                # Emphasize earlier steps (you can invert this if you want stronger long-horizon caution)
                 urgency_weight = max(0.0, 1.0 - t / max(1, T_use))
+                penalty = (self.weights.w_margin * phi).astype(np.float32, copy=False)
 
-                penalty = self.weights.w_margin * phi  # (P,)
-
-                # Optional "progress bonus": reduce cost when d_lower increases over time
-                # (encourages moving toward safer regions along the horizon)
                 if prev_d_lower is not None:
                     delta = d_lower - prev_d_lower
                     gain = np.maximum(delta, 0.0)
-                    gain = np.minimum(gain, 0.5)  # cap
-                    penalty = penalty - self._eta * gain
+                    gain = np.minimum(gain, 0.5)
+                    penalty = penalty - (self._eta * gain).astype(np.float32, copy=False)
 
                 prev_d_lower = d_lower
-
                 safety_acc += urgency_weight * penalty
 
-                # Slack summary accumulation (only early steps)
-                # slack_t > 0 means satisfying a tightened margin (safe_rad + target_slack)
-                slack_t = d_lower - (self.safe_rad + self._target_slack)
-                w_t = np.exp(-t / 0.9)  # heavier weight near t=0
-                softmin_acc += w_t * np.exp(-slack_t / tau)
+                # Slack summary accumulation
+                slack_t = d_lower - (self.safe_rad + self._target_slack)   # (P,)
+                w_t = np.exp(-t / 0.9).astype(np.float32)                  # scalar
+                softmin_acc += w_t * np.exp(-slack_t / tau).astype(np.float32, copy=False)
 
-            # Add soft safety shaping to cost
             total_cost = total_cost + self.weights.w_safety * (safety_acc / max(1, T_use))
-
-            # Convert accumulator into a "soft minimum slack" proxy:
-            # larger acc => more negative slack somewhere => larger penalty.
             softmin = -tau * np.log(softmin_acc + 1e-12)
 
         best_idx = int(np.argmin(total_cost))
